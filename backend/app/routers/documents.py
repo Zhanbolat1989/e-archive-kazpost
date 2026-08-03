@@ -5,6 +5,7 @@ from datetime import datetime
 
 from fastapi import (
     APIRouter, Depends, UploadFile, File, Form, HTTPException, BackgroundTasks,
+    Request,
 )
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -15,7 +16,7 @@ from ..autonumber import is_internal_type, next_document_number
 from ..db import get_db
 from ..models import (
     User, Role, Document, DocStatus, DocType, DOC_TYPE_GROUPS, Case, RegCard,
-    DestructionActItem,
+    DestructionActItem, AuditLog, AuditActionType,
 )
 from ..retention import rule_for, compute_until
 from ..schemas import (
@@ -305,12 +306,41 @@ def document_types(_: User = Depends(get_current_user)) -> list[dict]:
 
 @router.get("/{doc_id}", response_model=DocumentDetail)
 def get_document(
-    doc_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+    doc_id: str, request: Request, db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     doc = db.get(Document, doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Документ не найден")
+    # История использования документа (п. 6.3 ТС «отслеживание истории
+    # использования дел/документов»): просмотр карточки — тоже использование.
+    audit.record(db, user, "document.view", "document", doc.id, doc.title,
+                 request=request, action_type=AuditActionType.read)
     return doc
+
+
+@router.get("/{doc_id}/usage")
+def document_usage(doc_id: str, db: Session = Depends(get_db),
+                   _: User = Depends(get_current_user)) -> list[dict]:
+    """Лист использования документа: кто и когда обращался (п. 6.3 ТС)."""
+    doc = db.get(Document, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    rows = (
+        db.query(AuditLog)
+        .filter(AuditLog.object_type == "document", AuditLog.object_id == doc_id)
+        .order_by(AuditLog.ts.desc())
+        .limit(200)
+        .all()
+    )
+    return [
+        {
+            "ts": r.ts.isoformat(), "user_email": r.user_email, "action": r.action,
+            "action_type": r.action_type, "ip_address": r.ip_address,
+            "detail": r.detail, "result": r.result,
+        }
+        for r in rows
+    ]
 
 
 @router.get("/{doc_id}/certified-copy")
@@ -368,15 +398,30 @@ def download_document(
 def update_document(
     doc_id: str,
     payload: DocumentUpdate,
+    request: Request,
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles(Role.admin, Role.archivist)),
+    user: User = Depends(require_roles(Role.admin, Role.archivist)),
 ):
     doc = db.get(Document, doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Документ не найден")
-    for field, value in payload.model_dump(exclude_none=True).items():
+    changes = payload.model_dump(exclude_none=True)
+    # Оптимистичная блокировка (п. 6.4 ТС): с карточкой могут работать
+    # несколько пользователей, но правка поверх чужой версии отклоняется,
+    # иначе более позднее сохранение молча затирало бы чужие изменения.
+    client_version = changes.pop("version", None)
+    if client_version is not None and int(client_version) != (doc.version or 1):
+        raise HTTPException(
+            status_code=409,
+            detail="Карточку уже изменил другой пользователь — обновите её и повторите",
+        )
+    for field, value in changes.items():
         setattr(doc, field, value)
+    doc.version = (doc.version or 1) + 1
     db.commit()
+    audit.record(db, user, "document.update", "document", doc.id,
+                 ", ".join(changes.keys()), request=request,
+                 action_type=AuditActionType.update)
     db.refresh(doc)
     # Re-index metadata (does not touch the WORM-locked original).
     if doc.status == DocStatus.ready:

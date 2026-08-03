@@ -64,6 +64,28 @@ class Settings(BaseSettings):
     # For small local models keep off: retrieval-augmented answering is used.
     AGENT_TOOL_LOOP: bool = False
 
+    # ---- Информационная безопасность (ТС-176, раздел 14) ----
+    # п. 4.4: учётная запись блокируется после трёх неверных вводов пароля
+    LOGIN_MAX_ATTEMPTS: int = 3
+    # п. 3: второй фактор — код на email при входе с нового устройства
+    # либо при наличии второй одновременной сессии
+    TWOFA_ENABLED: bool = True
+    TWOFA_CODE_TTL_MINUTES: int = 10
+    TWOFA_MAX_ATTEMPTS: int = 3
+    # п. 2 требований к аудиту: ≥3 мес. оперативного доступа, ≥1 года архивного
+    AUDIT_OPERATIONAL_DAYS: int = 90
+    AUDIT_ARCHIVE_DAYS: int = 365
+
+    # ---- SMTP для кодов второго фактора ----
+    # Если хост не задан, код второго фактора пишется в журнал сервера
+    # (режим разработки) — почта наружу не отправляется.
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = "e-archive <no-reply@earchive.kz>"
+    SMTP_TLS: bool = True
+
     FIRST_ADMIN_EMAIL: str = "admin@earchive.kz"
     FIRST_ADMIN_PASSWORD: str = "admin12345"
 

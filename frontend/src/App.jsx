@@ -10,6 +10,18 @@ import Lifecycle from "./pages/Lifecycle.jsx";
 import Issues from "./pages/Issues.jsx";
 import Upload from "./pages/Upload.jsx";
 import Search from "./pages/Search.jsx";
+import Reports from "./pages/Reports.jsx";
+import Enterprise from "./pages/Enterprise.jsx";
+import Security from "./pages/Security.jsx";
+import Account from "./pages/Account.jsx";
+import Help from "./pages/Help.jsx";
+
+// Раздел «Безопасность» — только для администратора: там учётные записи,
+// сессии и аудиторский след.
+function AdminOnly({ children }) {
+  const { user } = useAuth();
+  return user?.role === "admin" ? children : <Navigate to="/" replace />;
+}
 
 function Protected({ children }) {
   const { user, loading } = useAuth();
@@ -38,6 +50,11 @@ function Shell() {
         <Route path="issues" element={<Issues />} />
         <Route path="search" element={<Search />} />
         <Route path="upload" element={<Upload />} />
+        <Route path="reports" element={<Reports />} />
+        <Route path="enterprise" element={<Enterprise />} />
+        <Route path="account" element={<Account />} />
+        <Route path="help" element={<Help />} />
+        <Route path="security" element={<AdminOnly><Security /></AdminOnly>} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

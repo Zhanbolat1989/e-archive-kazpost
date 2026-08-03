@@ -29,15 +29,21 @@ export default function Layout() {
           <NavLink to="/lifecycle"><Icon name="trash" /> Уничтожение</NavLink>
           <NavLink to="/search"><Icon name="bot" /> ИИ-ассистент</NavLink>
           <NavLink to="/upload"><Icon name="upload" /> Приём</NavLink>
+          <NavLink to="/reports"><Icon name="dashboard" /> Отчеты</NavLink>
+          <NavLink to="/enterprise"><Icon name="folder" /> Предприятие</NavLink>
+          {user?.role === "admin" && (
+            <NavLink to="/security"><Icon name="list" /> Безопасность</NavLink>
+          )}
+          <NavLink to="/help"><Icon name="document" /> Помощь</NavLink>
         </nav>
         <div className="sidebar-foot">
-          <div className="user-chip">
+          <NavLink to="/account" className="user-chip user-chip-link">
             <div className="avatar">{(user?.full_name || user?.email || "?")[0]}</div>
             <div className="user-meta">
               <div className="user-name">{user?.full_name || user?.email}</div>
               <div className="user-role">{ROLE_LABEL[user?.role] || user?.role}</div>
             </div>
-          </div>
+          </NavLink>
           <button className="btn ghost small" onClick={logout}>Выйти</button>
         </div>
       </aside>

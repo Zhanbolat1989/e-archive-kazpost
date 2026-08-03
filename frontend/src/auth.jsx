@@ -20,20 +20,43 @@ export function AuthProvider({ children }) {
       .finally(() => setLoading(false));
   }, []);
 
-  async function login(email, password) {
-    const { access_token } = await api.login(email, password);
-    localStorage.setItem("token", access_token);
-    const me = await api.me();
-    setUser(me);
+  async function finish(accessToken) {
+    localStorage.setItem("token", accessToken);
+    setUser(await api.me());
   }
 
-  function logout() {
+  // Возвращает описание второго фактора, если система запросила код (п. 3.3 ТС).
+  async function login(email, password) {
+    const res = await api.login(email, password);
+    if (res.twofa_required) {
+      return { twofaRequired: true, challengeId: res.challenge_id, delivery: res.delivery };
+    }
+    await finish(res.access_token);
+    return { twofaRequired: false };
+  }
+
+  async function verifyTwoFactor(challengeId, code) {
+    const { access_token } = await api.verifyTwoFactor(challengeId, code);
+    await finish(access_token);
+  }
+
+  async function logout() {
+    // Сессию гасим на сервере, иначе токен остался бы действующим до истечения.
+    try {
+      await api.logout();
+    } catch (_) {}
     localStorage.removeItem("token");
     setUser(null);
   }
 
+  async function refresh() {
+    setUser(await api.me());
+  }
+
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout }}>
+    <AuthContext.Provider
+      value={{ user, loading, login, verifyTwoFactor, logout, refresh }}
+    >
       {children}
     </AuthContext.Provider>
   );

@@ -12,11 +12,11 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..models import (
     User, Role, Document, DocStatus, Case, CaseStatus,
-    RegCard, DestructionAct, DestructionActItem, ActStatus, AuditLog,
+    RegCard, DestructionAct, DestructionActItem, ActStatus,
 )
 from ..schemas import (
     RegCardOut, RegCardUpdate,
-    DestructionActCreate, DestructionActOut, DestructionActDetail, AuditOut,
+    DestructionActCreate, DestructionActOut, DestructionActDetail,
 )
 from ..security import get_current_user, require_roles
 from ..services import search as search_svc
@@ -324,12 +324,9 @@ def inventory_check_pdf(db: Session = Depends(get_db),
     )
 
 
-# ---------- Журнал аудита ----------
-@router.get("/audit", response_model=list[AuditOut])
-def audit_log(limit: int = 100, db: Session = Depends(get_db),
-              _: User = Depends(require_roles(Role.admin))):
-    return (db.query(AuditLog).order_by(AuditLog.ts.desc())
-            .limit(min(limit, 500)).all())
+# Журнал аудита переехал в routers/audit.py (GET /api/audit с фильтрами по
+# пользователю, типу действия и результату — раздел 14 ТС). Прежний эндпоинт
+# здесь объявлял тот же путь и, будучи подключённым раньше, перекрывал новый.
 
 
 # ---------- Книга учёта поступления и выбытия ----------

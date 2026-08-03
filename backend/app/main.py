@@ -9,10 +9,12 @@ from .models import User, Role
 from .security import hash_password
 import threading
 
+from . import migrate
 from .services import storage, search, embeddings, llm
 from .routers import (
     auth, documents, search as search_router, signatures, stats,
     nomenclature, cases, forms, lifecycle, issues,
+    audit as audit_router, enterprise, reports, approvals, exports,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +40,12 @@ app.include_router(cases.router)
 app.include_router(forms.router)
 app.include_router(lifecycle.router)
 app.include_router(issues.router)
+# Модули по ТС-176: аудиторский след, «Предприятие», отчёты, согласование, XML
+app.include_router(audit_router.router)
+app.include_router(enterprise.router)
+app.include_router(reports.router)
+app.include_router(approvals.router)
+app.include_router(exports.router)
 
 
 def _bootstrap_admin() -> None:
@@ -62,6 +70,12 @@ def _bootstrap_admin() -> None:
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
+    # Новые колонки в существующих таблицах create_all не добавляет — дотягиваем
+    # схему отдельно (идемпотентно, безопасно при каждом старте).
+    try:
+        migrate.run()
+    except Exception:  # noqa: BLE001
+        log.exception("Миграция схемы не выполнена")
     _bootstrap_admin()
     try:
         storage.ensure_bucket()

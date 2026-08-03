@@ -13,11 +13,49 @@ class Token(BaseModel):
     token_type: str = "bearer"
 
 
+class LoginResponse(BaseModel):
+    """Ответ на вход: либо токен, либо требование второго фактора (п. 3.3 ТС)."""
+    access_token: Optional[str] = None
+    token_type: str = "bearer"
+    twofa_required: bool = False
+    challenge_id: Optional[str] = None
+    # email — код отправлен письмом; server_log — SMTP не настроен, код в журнале
+    delivery: Optional[str] = None
+
+
+class TwoFactorVerify(BaseModel):
+    challenge_id: str
+    code: str
+
+
 class UserCreate(BaseModel):
     email: EmailStr
     password: str
     full_name: str = ""
     role: Role = Role.archivist
+    position: str = ""
+    department_id: Optional[str] = None
+    can_sign: bool = False
+
+
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = None
+    role: Optional[Role] = None
+    position: Optional[str] = None
+    department_id: Optional[str] = None
+    can_sign: Optional[bool] = None
+    is_active: Optional[bool] = None
+
+
+class ProfileUpdate(BaseModel):
+    """Личный кабинет (п. 4.7 ТС): пользователь правит только свои данные."""
+    full_name: Optional[str] = None
+    position: Optional[str] = None
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
 
 
 class UserOut(BaseModel):
@@ -25,6 +63,127 @@ class UserOut(BaseModel):
     email: EmailStr
     full_name: str
     role: Role
+    position: str = ""
+    department_id: Optional[str] = None
+    department_name: Optional[str] = None
+    can_sign: bool = False
+    is_active: bool = True
+    locked: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class OrganizationIn(BaseModel):
+    """Модуль «Предприятие» (п. 4.8 ТС)."""
+    name: str
+    short_name: str = ""
+    bin: str = ""
+    address: str = ""
+    phone: str = ""
+    email: str = ""
+    head_name: str = ""
+    head_position: str = ""
+
+
+class OrganizationOut(OrganizationIn):
+    id: str
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DepartmentIn(BaseModel):
+    name: str
+    index: str = ""
+    parent_id: Optional[str] = None
+    head_name: str = ""
+    head_position: str = ""
+
+
+class DepartmentOut(DepartmentIn):
+    id: str
+    users_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class ApprovalStepIn(BaseModel):
+    approver_email: str
+    order_no: int = 1
+
+
+class ApprovalCreate(BaseModel):
+    """Маршрут согласования карточки дела/документа (п. 4.10 ТС)."""
+    object_type: str            # document | case
+    object_id: str
+    steps: list[ApprovalStepIn]
+
+
+class ApprovalDecision(BaseModel):
+    approve: bool
+    comment: str = ""
+
+
+class ApprovalStepOut(BaseModel):
+    id: str
+    order_no: int
+    approver_email: str
+    approver_name: str
+    status: str
+    comment: str
+    decided_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ApprovalOut(BaseModel):
+    id: str
+    object_type: str
+    object_id: str
+    title: str
+    status: str
+    created_by: str
+    created_at: datetime
+    closed_at: Optional[datetime] = None
+    steps: list[ApprovalStepOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class AuditOut(BaseModel):
+    """Запись аудиторского следа в формате раздела 14 ТС."""
+    id: str
+    ts: datetime
+    user_email: str
+    action: str
+    action_type: str
+    object_type: str
+    object_id: str
+    detail: str
+    ip_address: str
+    user_agent: str
+    result: bool
+    archived: bool
+
+    class Config:
+        from_attributes = True
+
+
+class SessionOut(BaseModel):
+    """Текущая сессия пользователя (п. 4.9 ТС)."""
+    id: str
+    user_email: Optional[str] = None
+    ip_address: str
+    user_agent: str
+    created_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    current: bool = False
 
     class Config:
         from_attributes = True
@@ -62,6 +221,7 @@ class DocumentOut(BaseModel):
     real_estate_area: Optional[float] = None
     replaces_id: Optional[str] = None
     superseded_at: Optional[date] = None
+    version: int = 1
     created_at: datetime
     updated_at: datetime
 
@@ -229,19 +389,6 @@ class IssueOut(BaseModel):
 
 
 # ---- Аудит ----
-class AuditOut(BaseModel):
-    id: str
-    ts: datetime
-    user_email: str
-    action: str
-    object_type: str
-    object_id: str
-    detail: str
-
-    class Config:
-        from_attributes = True
-
-
 class DocumentUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
@@ -257,6 +404,9 @@ class DocumentUpdate(BaseModel):
     cadastral_number: Optional[str] = None
     real_estate_address: Optional[str] = None
     real_estate_area: Optional[float] = None
+    # Версия карточки, которую редактировал клиент (оптимистичная блокировка,
+    # п. 6.4 ТС). Если не передана, проверка конфликта не выполняется.
+    version: Optional[int] = None
 
 
 # ---- Search ----

@@ -156,6 +156,9 @@ class Case(Base):
     retention_until: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Оптимистичная блокировка карточки дела (п. 6.4 ТС): одновременная работа
+    # разрешена, но правка поверх чужой версии отклоняется с 409.
+    version: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class ActStatus(str, enum.Enum):
@@ -239,8 +242,25 @@ class IssueRecord(Base):
     created_by: Mapped[str] = mapped_column(String(255), default="")
 
 
+class AuditActionType(str, enum.Enum):
+    """Тип совершённого действия для аудиторского следа (ТС-176, разд. 14, п. 4.5)."""
+    create = "CREATE"
+    read = "READ"
+    update = "UPDATE"
+    delete = "DELETE"
+    login = "LOGIN"
+    logout = "LOGOUT"
+    security = "SECURITY"     # изменение прав, ролей, настроек безопасности
+
+
 class AuditLog(Base):
-    """Журнал аудита операций («цифровой архив», ред. 2026 приказа № 236)."""
+    """Аудиторский след (ТС-176 разд. 14; «цифровой архив» приказа № 236).
+
+    Формат записи по ТЗ: логин пользователя, дата и время, IP/рабочая станция,
+    объект действия, тип действия и результат. Записи никогда не удаляются —
+    по истечении срока оперативного доступа они лишь помечаются archived=True
+    (оперативный доступ ≥ 3 мес., архивный ≥ 1 год).
+    """
     __tablename__ = "audit_log"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
@@ -250,6 +270,46 @@ class AuditLog(Base):
     object_type: Mapped[str] = mapped_column(String(64), default="")
     object_id: Mapped[str] = mapped_column(String(64), default="")
     detail: Mapped[str] = mapped_column(Text, default="")
+    # --- поля, требуемые форматом аудиторского следа (разд. 14, п. 4) ---
+    ip_address: Mapped[str] = mapped_column(String(64), default="", index=True)
+    user_agent: Mapped[str] = mapped_column(String(512), default="")
+    action_type: Mapped[str] = mapped_column(String(16), default="UPDATE", index=True)
+    result: Mapped[bool] = mapped_column(default=True, index=True)
+    archived: Mapped[bool] = mapped_column(default=False, index=True)
+
+
+class Organization(Base):
+    """Модуль «Предприятие» (п. 4.8 ТС): сведения о заказчике и подписантах."""
+    __tablename__ = "organizations"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(512))
+    short_name: Mapped[str] = mapped_column(String(255), default="")
+    bin: Mapped[str] = mapped_column(String(12), default="")
+    address: Mapped[str] = mapped_column(String(512), default="")
+    phone: Mapped[str] = mapped_column(String(64), default="")
+    email: Mapped[str] = mapped_column(String(255), default="")
+    head_name: Mapped[str] = mapped_column(String(255), default="")
+    head_position: Mapped[str] = mapped_column(String(255), default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class Department(Base):
+    """Структурное подразделение организации (оргструктура, п. 4.8/4.10 ТС).
+    Дерево: parent_id ссылается на вышестоящее подразделение."""
+    __tablename__ = "departments"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(512))
+    index: Mapped[str] = mapped_column(String(64), default="", index=True)
+    parent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("departments.id"), nullable=True, index=True
+    )
+    head_name: Mapped[str] = mapped_column(String(255), default="")
+    head_position: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class User(Base):
@@ -261,6 +321,95 @@ class User(Base):
     hashed_password: Mapped[str] = mapped_column(String(255))
     role: Mapped[Role] = mapped_column(Enum(Role), default=Role.archivist)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # --- оргструктура и право подписи (п. 4.8 ТС) ---
+    department_id: Mapped[str | None] = mapped_column(
+        ForeignKey("departments.id"), nullable=True, index=True
+    )
+    department: Mapped["Department | None"] = relationship()
+    position: Mapped[str] = mapped_column(String(255), default="")
+    can_sign: Mapped[bool] = mapped_column(default=False)
+    # --- п. 4.4 разд. 14: блокировка учётной записи после трёх неверных вводов ---
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True)
+
+
+class UserSession(Base):
+    """Сессия пользователя: п. 4.9 ТС («отображать и управлять текущими
+    сессиями») и п. 3.2 разд. 14 (метаданные входа: браузер, IP, время)."""
+    __tablename__ = "user_sessions"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    user: Mapped["User"] = relationship()
+    jti: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    ip_address: Mapped[str] = mapped_column(String(64), default="")
+    user_agent: Mapped[str] = mapped_column(String(512), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+class LoginChallenge(Base):
+    """Второй фактор входа (п. 3.3 разд. 14 ТС): проверочный код, высылаемый
+    на email пользователя при входе с нового устройства или при второй сессии."""
+    __tablename__ = "login_challenges"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    code_hash: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    ip_address: Mapped[str] = mapped_column(String(64), default="")
+    user_agent: Mapped[str] = mapped_column(String(512), default="")
+
+
+class ApprovalStatus(str, enum.Enum):
+    pending = "На согласовании"
+    approved = "Согласовано"
+    rejected = "Отклонено"
+
+
+class ApprovalRequest(Base):
+    """Маршрут согласования карточки дела/документа (п. 4.10 ТС): шаги
+    согласования выстраиваются по оргструктуре заказчика."""
+    __tablename__ = "approval_requests"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    object_type: Mapped[str] = mapped_column(String(32), index=True)   # document | case
+    object_id: Mapped[str] = mapped_column(String(64), index=True)
+    title: Mapped[str] = mapped_column(String(512), default="")
+    status: Mapped[ApprovalStatus] = mapped_column(
+        Enum(ApprovalStatus, native_enum=False, length=32),
+        default=ApprovalStatus.pending, index=True,
+    )
+    created_by: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    steps: Mapped[list["ApprovalStep"]] = relationship(
+        back_populates="request", cascade="all, delete-orphan",
+        order_by="ApprovalStep.order_no",
+    )
+
+
+class ApprovalStep(Base):
+    """Шаг маршрута согласования: согласующий и его решение."""
+    __tablename__ = "approval_steps"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    request_id: Mapped[str] = mapped_column(ForeignKey("approval_requests.id"), index=True)
+    request: Mapped["ApprovalRequest"] = relationship(back_populates="steps")
+    order_no: Mapped[int] = mapped_column(Integer, default=1)
+    approver_email: Mapped[str] = mapped_column(String(255), index=True)
+    approver_name: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[ApprovalStatus] = mapped_column(
+        Enum(ApprovalStatus, native_enum=False, length=32), default=ApprovalStatus.pending
+    )
+    comment: Mapped[str] = mapped_column(Text, default="")
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class Document(Base):
@@ -331,6 +480,10 @@ class Document(Base):
     )
     replaces: Mapped["Document | None"] = relationship(remote_side=[id])
     superseded_at: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+
+    # Оптимистичная блокировка карточки документа (п. 6.4 ТС): одновременная
+    # работа разрешена, но правка поверх чужой версии отклоняется с 409.
+    version: Mapped[int] = mapped_column(Integer, default=1)
 
     # ЭРКК заводится на каждый документ и без него не имеет смысла — снимается
     # вместе с ним, иначе снятие документа с учёта падает на внешнем ключе.

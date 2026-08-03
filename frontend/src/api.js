@@ -275,4 +275,172 @@ export const api = {
       body: JSON.stringify({ cms_base64: cmsBase64, document_id: documentId }),
     }).then(handle);
   },
+
+  // ---- Второй фактор и сессии (раздел 14 ТС) ----
+  verifyTwoFactor(challengeId, code) {
+    return fetch(`${BASE}/auth/2fa`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ challenge_id: challengeId, code }),
+    }).then(handle);
+  },
+
+  logout() {
+    return fetch(`${BASE}/auth/logout`, { method: "POST", headers: authHeaders() })
+      .then(handle);
+  },
+
+  mySessions() {
+    return fetch(`${BASE}/auth/me/sessions`, { headers: authHeaders() }).then(handle);
+  },
+
+  revokeMySession(id) {
+    return fetch(`${BASE}/auth/me/sessions/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  allSessions() {
+    return fetch(`${BASE}/auth/sessions`, { headers: authHeaders() }).then(handle);
+  },
+
+  revokeSession(id) {
+    return fetch(`${BASE}/auth/sessions/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  updateProfile(payload) {
+    return fetch(`${BASE}/auth/me`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  changePassword(currentPassword, newPassword) {
+    return fetch(`${BASE}/auth/me/password`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+    }).then(handle);
+  },
+
+  // ---- Пользователи (администрирование, п. 4.9) ----
+  listUsers() {
+    return fetch(`${BASE}/auth/users`, { headers: authHeaders() }).then(handle);
+  },
+
+  createUser(payload) {
+    return fetch(`${BASE}/auth/users`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  updateUser(id, payload) {
+    return fetch(`${BASE}/auth/users/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  unlockUser(id) {
+    return fetch(`${BASE}/auth/users/${id}/unlock`, {
+      method: "POST", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  // ---- Аудиторский след (раздел 14) ----
+  auditTrail(params = {}) {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null)
+    );
+    return fetch(`${BASE}/audit?${q}`, { headers: authHeaders() }).then(handle);
+  },
+
+  auditStats() {
+    return fetch(`${BASE}/audit/stats`, { headers: authHeaders() }).then(handle);
+  },
+
+  archiveAudit() {
+    return fetch(`${BASE}/audit/archive`, { method: "POST", headers: authHeaders() })
+      .then(handle);
+  },
+
+  // ---- Модуль «Предприятие» (п. 4.8) ----
+  getOrganization() {
+    return fetch(`${BASE}/enterprise/organization`, { headers: authHeaders() }).then(handle);
+  },
+
+  saveOrganization(payload) {
+    return fetch(`${BASE}/enterprise/organization`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  listDepartments() {
+    return fetch(`${BASE}/enterprise/departments`, { headers: authHeaders() }).then(handle);
+  },
+
+  createDepartment(payload) {
+    return fetch(`${BASE}/enterprise/departments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  deleteDepartment(id) {
+    return fetch(`${BASE}/enterprise/departments/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  listSigners() {
+    return fetch(`${BASE}/enterprise/signers`, { headers: authHeaders() }).then(handle);
+  },
+
+  // ---- Модуль «Управление отчетами» (п. 4.4) ----
+  listReports() {
+    return fetch(`${BASE}/reports`, { headers: authHeaders() }).then(handle);
+  },
+
+  getReport(key) {
+    return fetch(`${BASE}/reports/${key}`, { headers: authHeaders() }).then(handle);
+  },
+
+  // ---- Маршруты согласования (п. 4.10) ----
+  listApprovals(objectType, objectId) {
+    const q = new URLSearchParams({ object_type: objectType, object_id: objectId });
+    return fetch(`${BASE}/approvals?${q}`, { headers: authHeaders() }).then(handle);
+  },
+
+  myApprovals() {
+    return fetch(`${BASE}/approvals/my`, { headers: authHeaders() }).then(handle);
+  },
+
+  createApproval(payload) {
+    return fetch(`${BASE}/approvals`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  decideApproval(id, approve, comment = "") {
+    return fetch(`${BASE}/approvals/${id}/decide`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ approve, comment }),
+    }).then(handle);
+  },
+
+  documentUsage(id) {
+    return fetch(`${BASE}/documents/${id}/usage`, { headers: authHeaders() }).then(handle);
+  },
 };
