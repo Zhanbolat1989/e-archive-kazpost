@@ -1,0 +1,201 @@
+import { useState, useRef, useEffect } from "react";
+import { api } from "../api.js";
+import DocumentModal from "../components/DocumentModal.jsx";
+
+const WELCOME = {
+  role: "assistant",
+  content:
+    "Здравствуйте! Я ИИ-агент архива. Могу искать по документам и читать их " +
+    "содержимое, чтобы ответить на ваш вопрос — и помню контекст диалога, так что " +
+    "можно задавать уточняющие вопросы.\n\n" +
+    "Например: «Какая была арендная плата по договору 2019 года?», а потом " +
+    "«А на какой срок он заключён?»",
+  sources: [],
+  steps: [],
+};
+
+const SUGGESTIONS = [
+  "Покажи все счета-фактуры за 2021 год",
+  "Какая арендная плата по договору аренды?",
+  "Сколько всего договоров с ТОО «Кагаз Логистик» и на какую сумму?",
+  "Какие условия оплаты в договоре подряда?",
+];
+
+const STEP_ICON = { search_archive: "🔍", filter_documents: "🗂️", read_document: "📄" };
+const STEP_LABEL = {
+  search_archive: "Поиск по содержимому",
+  filter_documents: "Фильтр по метаданным",
+  read_document: "Чтение документа",
+};
+
+const STORAGE_KEY = "earchive_agent_chat";
+
+function loadMessages() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    if (Array.isArray(saved) && saved.length) return saved;
+  } catch (_) {}
+  return [WELCOME];
+}
+
+export default function Search() {
+  const [messages, setMessages] = useState(loadMessages);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [selected, setSelected] = useState(null);
+  const endRef = useRef();
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, busy]);
+
+  // Persist the conversation so it survives tab/route switches and reloads.
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+    } catch (_) {}
+  }, [messages]);
+
+  function newDialog() {
+    setMessages([WELCOME]);
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (_) {}
+  }
+
+  async function ask(q) {
+    const question = (q ?? input).trim();
+    if (!question || busy) return;
+    setInput("");
+    const next = [...messages, { role: "user", content: question }];
+    setMessages(next);
+    setBusy(true);
+    try {
+      // Send only clean role/content turns (no tool internals) as history.
+      const history = next
+        .filter((m) => m.role === "user" || m.role === "assistant")
+        .map((m) => ({ role: m.role, content: m.content }));
+      const res = await api.agent(history);
+      setMessages((m) => [
+        ...m,
+        {
+          role: "assistant",
+          content: res.answer,
+          sources: res.sources || [],
+          steps: res.steps || [],
+        },
+      ]);
+    } catch (err) {
+      setMessages((m) => [
+        ...m,
+        { role: "assistant", content: `Ошибка: ${err.message}`, sources: [], steps: [] },
+      ]);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openSource(id) {
+    setSelected(await api.getDocument(id));
+  }
+
+  return (
+    <div className="page chat-page">
+      <header className="page-head">
+        <div>
+          <h1>🤖 ИИ-агент архива</h1>
+          <p className="muted">
+            Диалог с памятью · агент сам ищет и читает документы (локальная модель)
+          </p>
+        </div>
+        {messages.length > 1 && (
+          <button className="btn small" onClick={newDialog}>
+            Новый диалог
+          </button>
+        )}
+      </header>
+
+      <div className="chat-window">
+        {messages.map((m, i) => (
+          <div key={i} className={`msg ${m.role}`}>
+            <div className="msg-avatar">{m.role === "user" ? "Вы" : "ИИ"}</div>
+            <div className="msg-body">
+              {m.steps && m.steps.length > 0 && (
+                <details className="agent-steps">
+                  <summary>🧠 Действия агента ({m.steps.length})</summary>
+                  {m.steps.map((s, j) => (
+                    <div key={j} className="step">
+                      <span className="step-icon">{STEP_ICON[s.tool] || "⚙️"}</span>
+                      <b>{STEP_LABEL[s.tool] || s.tool}</b>
+                      {s.input && <span className="step-input">«{s.input}»</span>}
+                      {s.summary && <span className="muted"> — {s.summary}</span>}
+                    </div>
+                  ))}
+                </details>
+              )}
+              <div className="msg-text">{m.content}</div>
+              {m.sources && m.sources.length > 0 && (
+                <div className="msg-sources">
+                  <div className="msg-sources-label">Источники:</div>
+                  {m.sources.map((s, j) => (
+                    <button key={s.id} className="source-chip" onClick={() => openSource(s.id)}>
+                      <span className="source-num">[{j + 1}]</span> {s.title}
+                      {s.fond && <span className="source-fond"> · {s.fond}</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+
+        {busy && (
+          <div className="msg assistant">
+            <div className="msg-avatar">ИИ</div>
+            <div className="msg-body">
+              <div className="typing"><span></span><span></span><span></span></div>
+            </div>
+          </div>
+        )}
+        <div ref={endRef} />
+      </div>
+
+      {messages.length === 1 && (
+        <div className="suggestions">
+          {SUGGESTIONS.map((s) => (
+            <button key={s} className="chip" onClick={() => ask(s)}>{s}</button>
+          ))}
+        </div>
+      )}
+
+      <form
+        className="chat-input"
+        onSubmit={(e) => {
+          e.preventDefault();
+          ask();
+        }}
+      >
+        <input
+          autoFocus
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Спросите что-нибудь об архиве…"
+          disabled={busy}
+        />
+        <button className="btn primary" disabled={busy || !input.trim()}>
+          {busy ? "…" : "Отправить"}
+        </button>
+      </form>
+
+      {selected && (
+        <DocumentModal
+          key={selected.id}
+          doc={selected}
+          onClose={() => setSelected(null)}
+          onChanged={() => openSource(selected.id)}
+          onOpenDocument={openSource}
+        />
+      )}
+    </div>
+  );
+}
