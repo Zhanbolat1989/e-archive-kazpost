@@ -3,11 +3,12 @@ import io
 import json
 import zipfile
 from collections import defaultdict
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy import extract, func
+from sqlalchemy.orm import Session, load_only
 
 from ..db import get_db
 from ..models import (
@@ -16,13 +17,14 @@ from ..models import (
 )
 from ..schemas import (
     RegCardOut, RegCardUpdate,
-    DestructionActCreate, DestructionActOut, DestructionActDetail,
+    DestructionActCreate, DestructionActOut, DestructionActDetail, DestructionActUpdate,
 )
 from ..security import get_current_user, require_roles
 from ..services import search as search_svc
-from ..services import storage, audit
+from ..services import access, storage, audit
 from ..services import forms as forms_svc
-from ..services import printpack
+from ..services import packages, printpack
+from ..services import xlsx
 
 router = APIRouter(prefix="/api", tags=["lifecycle"])
 
@@ -118,6 +120,26 @@ def get_act(act_id: str, db: Session = Depends(get_db),
     return out
 
 
+@router.patch("/destruction-acts/{act_id}", response_model=DestructionActDetail)
+def update_act(act_id: str, payload: DestructionActUpdate,
+               db: Session = Depends(get_db),
+               user: User = Depends(require_roles(Role.admin, Role.archivist))):
+    """Правка проекта акта: протокол ЦЭК (ЭК) и примечание. Утверждённый акт
+    не правится — он уже основание для уничтожения."""
+    act = db.get(DestructionAct, act_id)
+    if not act:
+        raise HTTPException(status_code=404, detail="Акт не найден")
+    if act.status == ActStatus.approved:
+        raise HTTPException(status_code=409, detail="Утверждённый акт не редактируется")
+    changes = payload.model_dump(exclude_none=True)
+    for field, value in changes.items():
+        setattr(act, field, value.strip() if isinstance(value, str) else value)
+    db.commit()
+    audit.record(db, user, "destruction.update", "act", act.id,
+                 ", ".join(changes) or "без изменений")
+    return get_act(act_id, db, user)
+
+
 @router.post("/destruction-acts/{act_id}/approve", response_model=DestructionActDetail)
 def approve_act(act_id: str, db: Session = Depends(get_db),
                 user: User = Depends(require_roles(Role.admin))):
@@ -129,6 +151,15 @@ def approve_act(act_id: str, db: Session = Depends(get_db),
         raise HTTPException(status_code=404, detail="Акт не найден")
     if act.status == ActStatus.approved:
         raise HTTPException(status_code=409, detail="Акт уже утверждён")
+    if act.kind == "ecopy" and not act.commission_protocol:
+        # ТС-176 п. 11.7: акт об уничтожении электронных копий утверждается
+        # руководителем «по согласованию с ЦЭК (ЭК)» — без протокола комиссии
+        # основания для уничтожения нет.
+        raise HTTPException(
+            status_code=409,
+            detail="Акт об уничтожении электронных копий утверждается по согласованию "
+                   "с ЦЭК (ЭК) — укажите номер и дату протокола комиссии",
+        )
     today = date.today()
     touched_cases: set[str] = set()
     for item in act.items:
@@ -177,6 +208,99 @@ def act_pdf(act_id: str, db: Session = Depends(get_db),
     )
 
 
+# ---------- Сроки уничтожения: перечни по годам (ТЗ АГП п. 8) ----------
+@router.get("/destruction-overview")
+def destruction_overview(db: Session = Depends(get_db),
+                         user: User = Depends(get_current_user)) -> dict:
+    """Три перечня, которых требует ТЗ: подлежащие уничтожению, не подлежащие
+    и приближающиеся к сроку — с разбивкой по годам уничтожения.
+
+    Год уничтожения — год, следующий за истечением срока хранения: документ
+    хранится до конца своего срока, уничтожается в делопроизводстве следующего
+    года (приказ № 235).
+    """
+    today = date.today()
+    horizon = today + timedelta(days=365)
+    # Только нужные колонки и только открытые роли категории: перечни строятся
+    # по всему архиву, и поднимать ради них распознанный текст каждого
+    # документа в память нельзя.
+    docs = (access.apply(db.query(Document), db, user)
+            .options(load_only(Document.id, Document.title, Document.doc_type,
+                               Document.permanent, Document.retention_label,
+                               Document.retention_until, Document.case_id))
+            .filter(Document.destroyed_at.is_(None),
+                    Document.status == DocStatus.ready)
+            .all())
+
+    def _row(d: Document) -> dict:
+        return {"id": d.id, "title": d.title,
+                "doc_type": d.doc_type.value if d.doc_type else "",
+                "retention": "Постоянно" if d.permanent else (d.retention_label or "—"),
+                "retention_until": d.retention_until.isoformat() if d.retention_until else "",
+                "case_id": d.case_id or ""}
+
+    to_destroy = [d for d in docs if not d.permanent and d.retention_until
+                  and d.retention_until < today]
+    approaching = [d for d in docs if not d.permanent and d.retention_until
+                   and today <= d.retention_until <= horizon]
+    keep = [d for d in docs if d.permanent]
+
+    by_year: dict[int, int] = {}
+    for d in to_destroy + approaching:
+        year = d.retention_until.year + 1
+        by_year[year] = by_year.get(year, 0) + 1
+
+    # Уничтоженные только считаются — группировкой в базе, без загрузки строк.
+    year_col = extract("year", Document.destroyed_at)
+    destroyed_by_year: dict[int, int] = {
+        int(y): n for y, n in
+        access.apply(db.query(year_col, func.count(Document.id)), db, user)
+        .filter(Document.destroyed_at.isnot(None))
+        .group_by(year_col).all()
+    }
+
+    return {
+        "as_of": today.isoformat(),
+        "to_destroy": [_row(d) for d in sorted(to_destroy,
+                                               key=lambda x: x.retention_until)],
+        "approaching": [_row(d) for d in sorted(approaching,
+                                                key=lambda x: x.retention_until)],
+        "not_subject": [_row(d) for d in keep[:500]],
+        "not_subject_total": len(keep),
+        "by_destruction_year": [{"year": y, "documents": n}
+                                for y, n in sorted(by_year.items())],
+        "destroyed_by_year": [{"year": y, "documents": n}
+                              for y, n in sorted(destroyed_by_year.items())],
+    }
+
+
+@router.get("/destruction-overview/xlsx")
+def destruction_overview_xlsx(request: Request, db: Session = Depends(get_db),
+                              user: User = Depends(get_current_user)):
+    """Выгрузка перечней в Excel (п. 8)."""
+    data = destruction_overview(db, user)
+    rows = ([[r["title"], r["doc_type"], r["retention"], r["retention_until"],
+              "подлежит уничтожению"] for r in data["to_destroy"]]
+            + [[r["title"], r["doc_type"], r["retention"], r["retention_until"],
+                "срок приближается"] for r in data["approaching"]]
+            + [[r["title"], r["doc_type"], r["retention"], "—",
+                "не подлежит уничтожению"] for r in data["not_subject"]])
+    blob = xlsx.build(
+        title="Документы по срокам уничтожения",
+        subtitle=f"по состоянию на {data['as_of']}",
+        headers=["Заголовок", "Вид документа", "Срок хранения",
+                 "Хранить до", "Категория"],
+        rows=rows, sheet="Сроки уничтожения",
+    )
+    audit.record(db, user, "destruction.export", "archive", "",
+                 f"перечни по срокам: строк {len(rows)}", request=request)
+    return StreamingResponse(
+        io.BytesIO(blob), media_type=xlsx.MEDIA_TYPE,
+        headers={"Content-Disposition":
+                 f'attachment; filename="{xlsx.filename("destruction_overview")}"'},
+    )
+
+
 # ---------- Информационный пакет электронного дела (Фаза 5) ----------
 @router.get("/cases/{case_id}/export")
 def export_case(case_id: str, db: Session = Depends(get_db),
@@ -193,47 +317,18 @@ def export_case(case_id: str, db: Session = Depends(get_db),
         raise HTTPException(status_code=400, detail="В деле нет документов")
 
     buf = io.BytesIO()
-    manifest = {
-        "case": {"index": case.index, "title": case.title, "year": case.year,
-                 "volume": case.volume, "retention": case.retention_label,
-                 "exported_at": datetime.utcnow().isoformat(),
-                 "exported_by": user.email},
-        "documents": [],
-    }
-    control_lines = []
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for idx, d in enumerate(docs, 1):
-            try:
-                blob = storage.get_object(d.storage_key)
-            except Exception:  # noqa: BLE001
-                continue
-            # Индексный префикс гарантирует уникальность имён в пакете.
-            arcname = (f"documents/{idx:03d}_"
-                       f"{(d.doc_number or d.id).replace('/', '_')}_{d.original_filename}")
-            zf.writestr(arcname, blob)
-            actual = hashlib.sha256(blob).hexdigest()
-            manifest["documents"].append({
-                "id": d.id, "number": d.doc_number, "title": d.title,
-                "type": d.doc_type.value, "date": d.doc_date.isoformat() if d.doc_date else None,
-                "file": arcname, "size": len(blob),
-                "sha256_catalog": d.checksum_sha256, "sha256_actual": actual,
-                "integrity": actual == d.checksum_sha256,
-                "signature_status": d.signature_status.value,
-                "annotation": d.annotation,
-            })
-            control_lines.append(
-                f"{arcname}: {actual} "
-                f"[{'OK' if actual == d.checksum_sha256 else 'MISMATCH'}]"
-            )
+        entry = packages.add_case(zf, case, docs)
+        manifest = {
+            "case": {"index": case.index, "title": case.title, "year": case.year,
+                     "volume": case.volume, "retention": case.retention_label,
+                     "exported_at": datetime.utcnow().isoformat(),
+                     "exported_by": user.email},
+            "documents": entry["documents"],
+            "missing": entry["missing"],
+        }
         zf.writestr("manifest.json",
                     json.dumps(manifest, ensure_ascii=False, indent=2))
-        zf.writestr("control_sheet.txt",
-                    "Контрольный лист проверки комплектности\n"
-                    + "\n".join(control_lines))
-        try:
-            zf.writestr("opis.pdf", forms_svc.render_pdf("e_opis", case, docs))
-        except Exception:  # noqa: BLE001
-            pass
     audit.record(db, user, "case.export", "case", case_id,
                  f"{case.index}: {len(manifest['documents'])} документов")
     safe = "".join(c for c in (case.index or "delo").replace("/", "-") if ord(c) < 128) or "delo"

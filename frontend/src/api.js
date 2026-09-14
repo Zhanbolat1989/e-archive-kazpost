@@ -20,6 +20,12 @@ async function handle(res) {
 }
 
 export const api = {
+  // Профиль редакции (название, оформление, состав меню). Без токена:
+  // запрашивается ещё до входа.
+  edition() {
+    return fetch(`${BASE}/meta/edition`).then(handle);
+  },
+
   async login(email, password) {
     const form = new URLSearchParams();
     form.set("username", email);
@@ -36,8 +42,16 @@ export const api = {
     return fetch(`${BASE}/auth/me`, { headers: authHeaders() }).then(handle);
   },
 
-  listDocuments() {
-    return fetch(`${BASE}/documents`, { headers: authHeaders() }).then(handle);
+  // Фильтры модуля «Документы» (ТЗ АГП п. 8): подразделение, вид, дело, год,
+  // срок хранения/уничтожения, очередь ручной проверки распознавания.
+  listDocuments(params = {}) {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null)
+    );
+    const qs = q.toString();
+    return fetch(`${BASE}/documents${qs ? `?${qs}` : ""}`, {
+      headers: authHeaders(),
+    }).then(handle);
   },
 
   dashboard() {
@@ -260,11 +274,22 @@ export const api = {
     }).then(handle);
   },
 
-  agent(messages) {
+  agent(messages, { requestId, signal } = {}) {
     return fetch(`${BASE}/search/agent`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ messages }),
+      body: JSON.stringify({ messages, request_id: requestId }),
+      signal,
+    }).then(handle);
+  },
+
+  // Останавливает генерацию на сервере: обрыв соединения сам по себе модель
+  // не останавливает, поэтому отмену передаём отдельным запросом.
+  cancelAgent(requestId) {
+    return fetch(`${BASE}/search/agent/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ request_id: requestId }),
     }).then(handle);
   },
 
@@ -288,6 +313,47 @@ export const api = {
   logout() {
     return fetch(`${BASE}/auth/logout`, { method: "POST", headers: authHeaders() })
       .then(handle);
+  },
+
+  // ---- Ключи доступа WebAuthn: вход по биометрии (ТС-176 разд. 14 п. 4.2) ----
+  passkeyStatus() {
+    return fetch(`${BASE}/auth/passkeys/status`).then(handle);
+  },
+
+  passkeyLoginOptions() {
+    return fetch(`${BASE}/auth/passkeys/login/options`, { method: "POST" }).then(handle);
+  },
+
+  passkeyLogin(challengeId, credential) {
+    return fetch(`${BASE}/auth/passkeys/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ challenge_id: challengeId, credential }),
+    }).then(handle);
+  },
+
+  listPasskeys() {
+    return fetch(`${BASE}/auth/passkeys`, { headers: authHeaders() }).then(handle);
+  },
+
+  passkeyRegisterOptions() {
+    return fetch(`${BASE}/auth/passkeys/register/options`, {
+      method: "POST", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  registerPasskey(challengeId, credential, name = "") {
+    return fetch(`${BASE}/auth/passkeys/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ challenge_id: challengeId, credential, name }),
+    }).then(handle);
+  },
+
+  deletePasskey(id) {
+    return fetch(`${BASE}/auth/passkeys/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
   },
 
   mySessions() {
@@ -395,6 +461,14 @@ export const api = {
     }).then(handle);
   },
 
+  updateDepartment(id, payload) {
+    return fetch(`${BASE}/enterprise/departments/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
   deleteDepartment(id) {
     return fetch(`${BASE}/enterprise/departments/${id}`, {
       method: "DELETE", headers: authHeaders(),
@@ -440,7 +514,510 @@ export const api = {
     }).then(handle);
   },
 
+  approvalsMeta() {
+    return fetch(`${BASE}/approvals/meta`, { headers: authHeaders() }).then(handle);
+  },
+
+  // Согласующие по шаблону — до запуска маршрута
+  previewApproval(payload) {
+    return fetch(`${BASE}/approvals/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  listRouteTemplates(objectType = "", includeInactive = false) {
+    const q = new URLSearchParams();
+    if (objectType) q.set("object_type", objectType);
+    if (includeInactive) q.set("include_inactive", "true");
+    return fetch(`${BASE}/approvals/templates?${q}`, { headers: authHeaders() }).then(handle);
+  },
+
+  createRouteTemplate(payload) {
+    return fetch(`${BASE}/approvals/templates`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  updateRouteTemplate(id, payload) {
+    return fetch(`${BASE}/approvals/templates/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  deleteRouteTemplate(id) {
+    return fetch(`${BASE}/approvals/templates/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  // ---- Справочники (п. 4.9) ----
+  listDictionaries() {
+    return fetch(`${BASE}/dictionaries`, { headers: authHeaders() }).then(handle);
+  },
+
+  // Действующие значения одного справочника — для подсказок и выбора в формах
+  dictionaryValues(kind) {
+    return fetch(`${BASE}/dictionaries`, { headers: authHeaders() })
+      .then(handle)
+      .then((list) => (list.find((d) => d.kind === kind)?.entries || [])
+        .filter((x) => x.is_active)
+        .map((x) => x.value));
+  },
+
+  addDictionaryEntry(kind, payload) {
+    return fetch(`${BASE}/dictionaries/${kind}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  updateDictionaryEntry(id, payload) {
+    return fetch(`${BASE}/dictionaries/entries/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  // ---- НТО, экспертные комиссии, передача в госархив (п. 5.3, 8.2, 10.2–10.5) ----
+  ntoMeta() {
+    return fetch(`${BASE}/nto/meta`, { headers: authHeaders() }).then(handle);
+  },
+
+  listProtocols() {
+    return fetch(`${BASE}/nto/protocols`, { headers: authHeaders() }).then(handle);
+  },
+
+  createProtocol(payload) {
+    return fetch(`${BASE}/nto/protocols`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  updateProtocol(id, payload) {
+    return fetch(`${BASE}/nto/protocols/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  deleteProtocol(id) {
+    return fetch(`${BASE}/nto/protocols/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  addProtocolDecision(protocolId, payload) {
+    return fetch(`${BASE}/nto/protocols/${protocolId}/decisions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  deleteProtocolDecision(protocolId, decisionId) {
+    return fetch(`${BASE}/nto/protocols/${protocolId}/decisions/${decisionId}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  // Решения комиссий по объекту — для карточек описи и акта
+  objectDecisions(objectType, objectId) {
+    const q = new URLSearchParams({ object_type: objectType, object_id: objectId });
+    return fetch(`${BASE}/nto/decisions?${q}`, { headers: authHeaders() }).then(handle);
+  },
+
+  listNtoRecords(kind = "") {
+    const q = kind ? `?${new URLSearchParams({ kind })}` : "";
+    return fetch(`${BASE}/nto/records${q}`, { headers: authHeaders() }).then(handle);
+  },
+
+  createNtoRecord(payload) {
+    return fetch(`${BASE}/nto/records`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  updateNtoRecord(id, payload) {
+    return fetch(`${BASE}/nto/records/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  approveNtoRecord(id) {
+    return fetch(`${BASE}/nto/records/${id}/approve`, {
+      method: "POST", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  deleteNtoRecord(id) {
+    return fetch(`${BASE}/nto/records/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  listTransfers() {
+    return fetch(`${BASE}/nto/transfers`, { headers: authHeaders() }).then(handle);
+  },
+
+  createTransfer(payload) {
+    return fetch(`${BASE}/nto/transfers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  updateTransfer(id, payload) {
+    return fetch(`${BASE}/nto/transfers/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+
+  deleteTransfer(id) {
+    return fetch(`${BASE}/nto/transfers/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  // Дела приняты госархивом: акт закрывается, дела получают статус «Передано»
+  completeTransfer(id) {
+    return fetch(`${BASE}/nto/transfers/${id}/complete`, {
+      method: "POST", headers: authHeaders(),
+    }).then(handle);
+  },
+
   documentUsage(id) {
     return fetch(`${BASE}/documents/${id}/usage`, { headers: authHeaders() }).then(handle);
+  },
+
+  // ---- Качество оцифровки и реквизиты (ТЗ АГП п. 12.1, 12.5) ----
+  reviewQueue() {
+    return fetch(`${BASE}/documents/meta/review`, { headers: authHeaders() }).then(handle);
+  },
+  acceptReview(id) {
+    return fetch(`${BASE}/documents/${id}/review/accept`, {
+      method: "POST", headers: authHeaders(),
+    }).then(handle);
+  },
+  documentEntities(id) {
+    return fetch(`${BASE}/documents/${id}/entities`, { headers: authHeaders() }).then(handle);
+  },
+  documentChanges(id) {
+    return fetch(`${BASE}/documents/${id}/changes`, { headers: authHeaders() }).then(handle);
+  },
+
+  // ---- Архивные запросы (ТЗ АГП п. 8) ----
+  listArchiveRequests(params = {}) {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null)
+    );
+    return fetch(`${BASE}/archive-requests?${q}`, { headers: authHeaders() }).then(handle);
+  },
+  requestStatuses() {
+    return fetch(`${BASE}/archive-requests/meta/statuses`, { headers: authHeaders() }).then(handle);
+  },
+  createArchiveRequest(payload) {
+    return fetch(`${BASE}/archive-requests`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+  updateArchiveRequest(id, payload) {
+    return fetch(`${BASE}/archive-requests/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+  deleteArchiveRequest(id) {
+    return fetch(`${BASE}/archive-requests/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  // ---- Описи дел ----
+  listInventories(params = {}) {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null)
+    );
+    return fetch(`${BASE}/inventories?${q}`, { headers: authHeaders() }).then(handle);
+  },
+  inventoryKinds() {
+    return fetch(`${BASE}/inventories/meta/kinds`, { headers: authHeaders() }).then(handle);
+  },
+  getInventory(id) {
+    return fetch(`${BASE}/inventories/${id}`, { headers: authHeaders() }).then(handle);
+  },
+  createInventory(payload) {
+    return fetch(`${BASE}/inventories`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+  refillInventory(id) {
+    return fetch(`${BASE}/inventories/${id}/refill`, {
+      method: "POST", headers: authHeaders(),
+    }).then(handle);
+  },
+  deleteInventory(id) {
+    return fetch(`${BASE}/inventories/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  // ---- Вложения к карточкам описей, актов, запросов, номенклатуры ----
+  listAttachments(ownerType, ownerId) {
+    const q = new URLSearchParams({ owner_type: ownerType, owner_id: ownerId });
+    return fetch(`${BASE}/attachments?${q}`, { headers: authHeaders() }).then(handle);
+  },
+  uploadAttachment(ownerType, ownerId, file) {
+    const q = new URLSearchParams({ owner_type: ownerType, owner_id: ownerId });
+    const form = new FormData();
+    form.append("file", file);
+    return fetch(`${BASE}/attachments?${q}`, {
+      method: "POST", headers: authHeaders(), body: form,
+    }).then(handle);
+  },
+  deleteAttachment(id) {
+    return fetch(`${BASE}/attachments/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  // ---- Импорт пакетов оцифровки и восстановление из копии ----
+  listImports() {
+    return fetch(`${BASE}/imports`, { headers: authHeaders() }).then(handle);
+  },
+  getImport(id) {
+    return fetch(`${BASE}/imports/${id}`, { headers: authHeaders() }).then(handle);
+  },
+  uploadImport(file) {
+    const form = new FormData();
+    form.append("file", file);
+    return fetch(`${BASE}/imports`, {
+      method: "POST", headers: authHeaders(), body: form,
+    }).then(handle);
+  },
+
+  // ---- Номенклатура: правка, статусы, сводная форма ----
+  updateNomenclature(id, payload) {
+    return fetch(`${BASE}/nomenclature/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+  setNomenclatureStatus(id, status) {
+    const q = new URLSearchParams({ status });
+    return fetch(`${BASE}/nomenclature/${id}/status?${q}`, {
+      method: "POST", headers: authHeaders(),
+    }).then(handle);
+  },
+  nomenclatureStatuses() {
+    return fetch(`${BASE}/nomenclature/meta/statuses`, { headers: authHeaders() }).then(handle);
+  },
+
+  // ---- Сроки уничтожения: перечни по годам ----
+  destructionOverview() {
+    return fetch(`${BASE}/destruction-overview`, { headers: authHeaders() }).then(handle);
+  },
+
+  // ---- Аннотация дела, составленная ИИ (п. 12.4) ----
+  annotateCase(id) {
+    return fetch(`${BASE}/cases/${id}/annotate`, {
+      method: "POST", headers: authHeaders(),
+    }).then(handle);
+  },
+
+  // ---- Помощь: обращения в поддержку ----
+  listTickets(params = {}) {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null)
+    );
+    return fetch(`${BASE}/support?${q}`, { headers: authHeaders() }).then(handle);
+  },
+  createTicket(payload) {
+    return fetch(`${BASE}/support`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+  answerTicket(id, payload) {
+    return fetch(`${BASE}/support/${id}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+  // Сроки SLA, повторное исполнение и расчёт оплаты (ТС-176 разд. 13)
+  supportMeta() {
+    return fetch(`${BASE}/support/meta`, { headers: authHeaders() }).then(handle);
+  },
+  takeTicket(id) {
+    return fetch(`${BASE}/support/${id}/take`, {
+      method: "POST", headers: authHeaders(),
+    }).then(handle);
+  },
+  closeTicket(id) {
+    return fetch(`${BASE}/support/${id}/close`, {
+      method: "POST", headers: authHeaders(),
+    }).then(handle);
+  },
+  reopenTicket(id, reason = "") {
+    return fetch(`${BASE}/support/${id}/reopen`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ reason }),
+    }).then(handle);
+  },
+  slaReport(params = {}) {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null)
+    );
+    return fetch(`${BASE}/support/sla?${q}`, { headers: authHeaders() }).then(handle);
+  },
+
+  // ---- Администрирование (ТЗ АГП п. 8–9) ----
+  changeHistory(params = {}) {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null)
+    );
+    return fetch(`${BASE}/admin/changes?${q}`, { headers: authHeaders() }).then(handle);
+  },
+  docAccess() {
+    return fetch(`${BASE}/admin/doc-access`, { headers: authHeaders() }).then(handle);
+  },
+  docAccessGroups() {
+    return fetch(`${BASE}/admin/doc-access/groups`, { headers: authHeaders() }).then(handle);
+  },
+  setDocAccess(role, docGroups) {
+    return fetch(`${BASE}/admin/doc-access`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ role, doc_groups: docGroups }),
+    }).then(handle);
+  },
+  listApiKeys() {
+    return fetch(`${BASE}/admin/api-keys`, { headers: authHeaders() }).then(handle);
+  },
+  createApiKey(payload) {
+    return fetch(`${BASE}/admin/api-keys`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+  revokeApiKey(id) {
+    return fetch(`${BASE}/admin/api-keys/${id}`, {
+      method: "DELETE", headers: authHeaders(),
+    }).then(handle);
+  },
+  agentLog(params = {}) {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null)
+    );
+    return fetch(`${BASE}/admin/agent-log?${q}`, { headers: authHeaders() }).then(handle);
+  },
+  agentStats() {
+    return fetch(`${BASE}/admin/agent-log/stats`, { headers: authHeaders() }).then(handle);
+  },
+
+  // ---- Сканирование (ТС-176 п. 4.5) и учёт работ оцифровки ----
+  scanningArticles(year) {
+    const q = new URLSearchParams({ year: String(year) });
+    return fetch(`${BASE}/scanning/articles?${q}`, { headers: authHeaders() }).then(handle);
+  },
+  scanningCreateCase(payload) {
+    return fetch(`${BASE}/scanning/cases`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+  scanningUpload(caseId, formData) {
+    return fetch(`${BASE}/scanning/cases/${caseId}/documents`, {
+      method: "POST", headers: authHeaders(), body: formData,
+    }).then(handle);
+  },
+  scanningStages(caseId) {
+    return fetch(`${BASE}/scanning/cases/${caseId}/stages`, { headers: authHeaders() }).then(handle);
+  },
+  scanningSetStage(caseId, stage, payload) {
+    return fetch(`${BASE}/scanning/cases/${caseId}/stages/${stage}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
+  },
+  scanningVolume(params = {}) {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null)
+    );
+    return fetch(`${BASE}/scanning/volume?${q}`, { headers: authHeaders() }).then(handle);
+  },
+
+  // ---- Электронные копии (ТС-176 п. 11.6–11.7) ----
+  listCopies(params = {}) {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null)
+    );
+    return fetch(`${BASE}/ecopies?${q}`, { headers: authHeaders() }).then(handle);
+  },
+  markCopy(id, isCopy) {
+    return fetch(`${BASE}/ecopies/${id}/mark`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ is_copy: isCopy }),
+    }).then(handle);
+  },
+  certifyCopy(id, cmsBase64, note = "") {
+    return fetch(`${BASE}/ecopies/${id}/certify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ cms_base64: cmsBase64, note }),
+    }).then(handle);
+  },
+  reconcileCopy(id, result, note = "") {
+    return fetch(`${BASE}/ecopies/${id}/reconcile`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ result, note }),
+    }).then(handle);
+  },
+  createCopyAct(documentIds, commissionProtocol = "", note = "") {
+    return fetch(`${BASE}/ecopies/destruction-acts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({
+        document_ids: documentIds, commission_protocol: commissionProtocol, note,
+      }),
+    }).then(handle);
+  },
+  updateDestructionAct(id, payload) {
+    return fetch(`${BASE}/destruction-acts/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(payload),
+    }).then(handle);
   },
 };

@@ -32,9 +32,12 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    # Наружу публикуются нестандартные порты: 9000–9001 часто заняты другими
+    # локальными стеками с MinIO. Backend обращается к хранилищу по внутренней
+    # сети (minio:9000), поэтому внешний порт нужен только для консоли.
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Web console
+      - "9010:9000"   # S3 API
+      - "9011:9001"   # Web console
     volumes:
       - miniodata:/data
     healthcheck:
@@ -144,7 +147,9 @@ services:
 
   backend:
     build: ./backend
-    mem_limit: 2g            # document processing + local model cache
+    # Две ONNX-модели резидентно (эмбеддинги ~120 МБ + кросс-энкодер ~600 МБ)
+    # плюс растеризация PDF при приёме. На 2 ГБ процесс убивался по OOM.
+    mem_limit: 3g
     env_file: .env
     depends_on:
       postgres: { condition: service_healthy }
@@ -154,7 +159,17 @@ services:
     ports:
       - "8001:8000"
     volumes:
-      - modelcache:/root/.cache
+      # Кэш моделей принадлежит непривилегированному пользователю образа.
+      - modelcache:/home/app/.cache
+    # Проба готовности проверяет БД, поиск и хранилище: без них приём и поиск
+    # документов не работают, и оркестратор не должен считать сервис исправным.
+    healthcheck:
+      test: ["CMD-SHELL",
+             "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health/ready',timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
     restart: unless-stopped
 
   frontend:
@@ -164,6 +179,13 @@ services:
       - backend
     ports:
       - "3001:80"
+    healthcheck:
+      # Именно 127.0.0.1: «localhost» в контейнере разрешается сначала в ::1,
+      # а nginx слушает IPv4 — проба падала бы на исправном сервисе.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
 
 volumes:

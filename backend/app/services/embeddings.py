@@ -49,5 +49,30 @@ def embed_passage(text: str) -> Optional[list[float]]:
     return _embed(text, "passage: ")
 
 
+def embed_passages(texts: list[str]) -> list[Optional[list[float]]]:
+    """Кодирует список фрагментов одной прогонкой модели.
+
+    Документ режется на чанки, и вызов embed_passage() на каждый означал бы
+    сотни отдельных инференсов ONNX на одно дело — модель загружается в
+    батчевом режиме и на длинных документах это разница в разы.
+    Возвращает вектор на каждый вход, None — на пустые строки.
+    """
+    prepared: list[str] = []
+    positions: list[int] = []
+    for i, raw in enumerate(texts):
+        text = (raw or "").strip()
+        if not text:
+            continue
+        prepared.append(f"passage: {text[:_MAX_CHARS]}" if _IS_E5 else text[:_MAX_CHARS])
+        positions.append(i)
+
+    out: list[Optional[list[float]]] = [None] * len(texts)
+    if not prepared:
+        return out
+    for pos, vec in zip(positions, _model().embed(prepared)):
+        out[pos] = [float(x) for x in vec]
+    return out
+
+
 def embed_query(text: str) -> Optional[list[float]]:
     return _embed(text, "query: ")

@@ -25,12 +25,15 @@ export default function Issues() {
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ case_id: "", requested_by: "", purpose: "", due_date: "" });
   const [error, setError] = useState("");
+  const [purposes, setPurposes] = useState([]);
 
   const load = useCallback(() => {
     api.listIssues().then(setIssues).catch((e) => setError(e.message));
     api.listCases().then(setCases).catch(() => {});
   }, []);
   useEffect(() => { load(); }, [load]);
+  // Справочник целей выдачи (ТС-176 п. 4.9) — подсказки, ввод свободный.
+  useEffect(() => { api.dictionaryValues("issue_purposes").then(setPurposes).catch(() => {}); }, []);
 
   async function create(e) {
     e.preventDefault();
@@ -83,7 +86,11 @@ export default function Issues() {
             </div>
           </div>
           <label>Цель использования</label>
-          <input value={form.purpose} onChange={(e) => setForm({ ...form, purpose: e.target.value })} placeholder="служебная необходимость…" />
+          <input value={form.purpose} list="issue-purposes"
+            onChange={(e) => setForm({ ...form, purpose: e.target.value })} placeholder="служебная необходимость…" />
+          <datalist id="issue-purposes">
+            {purposes.map((p) => <option key={p} value={p} />)}
+          </datalist>
           <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
             <button className="btn primary">Создать заказ</button>
             <button type="button" className="btn" onClick={() => setCreating(false)}>Отмена</button>

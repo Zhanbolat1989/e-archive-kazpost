@@ -56,6 +56,10 @@ def _document_el(parent: Element, db: Session, doc: Document) -> None:
     _t(f, "storage_key", doc.storage_key)
     if doc.pdfa_key:
         _t(f, "pdfa_key", doc.pdfa_key)
+    # Электронная копия (ТС-176 п. 11.6). Подпись удостоверения в выгрузку не
+    # входит, поэтому при приёме пакета копия снова проходит сверку.
+    if doc.copy_status:
+        _t(d, "copy_status", doc.copy_status)
 
     # ЭЦП документа
     sig = SubElement(d, "signature")

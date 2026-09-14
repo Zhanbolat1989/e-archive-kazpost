@@ -17,6 +17,15 @@ _client = _session.client(
 )
 
 
+def ping() -> bool:
+    """Доступно ли объектное хранилище (для пробы готовности сервиса)."""
+    try:
+        _client.head_bucket(Bucket=settings.MINIO_BUCKET)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def ensure_bucket() -> None:
     """Create the archive bucket with Object Lock (WORM) enabled if missing."""
     bucket = settings.MINIO_BUCKET
@@ -44,6 +53,26 @@ def put_original(key: str, data: bytes, content_type: str) -> None:
         ObjectLockMode="COMPLIANCE",
         ObjectLockRetainUntilDate=retain_until,
     )
+
+
+def put_object(key: str, data: bytes, content_type: str) -> None:
+    """Обычный объект без WORM-блокировки: вложения карточек и служебные файлы.
+
+    Блокировка хранения применяется только к принятым на хранение документам —
+    вложение (скан подписанного акта, письмо заявителя) допускает замену."""
+    _client.put_object(
+        Bucket=settings.MINIO_BUCKET, Key=key, Body=data, ContentType=content_type,
+    )
+
+
+def delete_object(key: str) -> bool:
+    """Удаляет объект. Оригиналы документов защищены WORM — для них операция
+    не проходит, и это ожидаемо; вызывающий код не должен из-за этого падать."""
+    try:
+        _client.delete_object(Bucket=settings.MINIO_BUCKET, Key=key)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def get_object(key: str) -> bytes:

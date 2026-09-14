@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "./auth.jsx";
+import { EditionProvider, moduleAllowed, useEdition } from "./edition.jsx";
 import Layout from "./components/Layout.jsx";
 import Login from "./pages/Login.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
@@ -9,18 +10,30 @@ import Nomenclature from "./pages/Nomenclature.jsx";
 import Lifecycle from "./pages/Lifecycle.jsx";
 import Issues from "./pages/Issues.jsx";
 import Upload from "./pages/Upload.jsx";
+import Scanning from "./pages/Scanning.jsx";
 import Search from "./pages/Search.jsx";
 import Reports from "./pages/Reports.jsx";
 import Enterprise from "./pages/Enterprise.jsx";
 import Security from "./pages/Security.jsx";
 import Account from "./pages/Account.jsx";
+import Support from "./pages/Support.jsx";
 import Help from "./pages/Help.jsx";
+import ArchiveRequests from "./pages/ArchiveRequests.jsx";
+import Inventories from "./pages/Inventories.jsx";
+import Nto from "./pages/Nto.jsx";
+import Imports from "./pages/Imports.jsx";
+import Quality from "./pages/Quality.jsx";
+import Admin from "./pages/Admin.jsx";
 
-// Раздел «Безопасность» — только для администратора: там учётные записи,
-// сессии и аудиторский след.
-function AdminOnly({ children }) {
+// Раздел недоступен по прямой ссылке, если он не входит в редакцию или закрыт
+// для роли: иначе скрытый из меню модуль открывался бы из закладки. Права это
+// не заменяет — их проверяет сервер.
+function ModuleRoute({ module, children }) {
+  const edition = useEdition();
   const { user } = useAuth();
-  return user?.role === "admin" ? children : <Navigate to="/" replace />;
+  return edition.has(module) && moduleAllowed(module, user?.role)
+    ? children
+    : <Navigate to="/" replace />;
 }
 
 function Protected({ children }) {
@@ -29,6 +42,29 @@ function Protected({ children }) {
   if (!user) return <Navigate to="/login" replace />;
   return children;
 }
+
+const PAGES = [
+  ["documents", "documents", <Documents />],
+  ["cases", "cases", <Cases />],
+  ["nomenclature", "nomenclature", <Nomenclature />],
+  ["lifecycle", "lifecycle", <Lifecycle />],
+  ["issues", "issues", <Issues />],
+  ["search", "search", <Search />],
+  ["scanning", "scanning", <Scanning />],
+  ["upload", "upload", <Upload />],
+  ["reports", "reports", <Reports />],
+  ["enterprise", "enterprise", <Enterprise />],
+  ["account", "account", <Account />],
+  ["support", "support", <Support />],
+  ["help", "help", <Help />],
+  ["archive-requests", "archive_requests", <ArchiveRequests />],
+  ["inventories", "inventories", <Inventories />],
+  ["nto", "nto", <Nto />],
+  ["quality", "quality", <Quality />],
+  ["imports", "imports", <Imports />],
+  ["admin", "admin", <Admin />],
+  ["security", "security", <Security />],
+];
 
 function Shell() {
   return (
@@ -43,18 +79,13 @@ function Shell() {
         }
       >
         <Route index element={<Dashboard />} />
-        <Route path="documents" element={<Documents />} />
-        <Route path="cases" element={<Cases />} />
-        <Route path="nomenclature" element={<Nomenclature />} />
-        <Route path="lifecycle" element={<Lifecycle />} />
-        <Route path="issues" element={<Issues />} />
-        <Route path="search" element={<Search />} />
-        <Route path="upload" element={<Upload />} />
-        <Route path="reports" element={<Reports />} />
-        <Route path="enterprise" element={<Enterprise />} />
-        <Route path="account" element={<Account />} />
-        <Route path="help" element={<Help />} />
-        <Route path="security" element={<AdminOnly><Security /></AdminOnly>} />
+        {PAGES.map(([path, module, element]) => (
+          <Route
+            key={path}
+            path={path}
+            element={<ModuleRoute module={module}>{element}</ModuleRoute>}
+          />
+        ))}
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
@@ -63,8 +94,10 @@ function Shell() {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <Shell />
-    </AuthProvider>
+    <EditionProvider>
+      <AuthProvider>
+        <Shell />
+      </AuthProvider>
+    </EditionProvider>
   );
 }

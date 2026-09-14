@@ -1,22 +1,36 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
+import { api } from "../api.js";
 import { useAuth } from "../auth.jsx";
+import { useEdition } from "../edition.jsx";
+import { passkeyErrorMessage, passkeysSupported } from "../webauthn.js";
 
 export default function Login() {
-  const { login, verifyTwoFactor, user } = useAuth();
+  const { login, verifyTwoFactor, loginWithPasskey, user } = useAuth();
+  const edition = useEdition();
   const navigate = useNavigate();
-  const [email, setEmail] = useState("admin@earchive.kz");
-  const [password, setPassword] = useState("admin12345");
+  // Демонстрационная учётная запись подставляется только в локальной работе:
+  // в контуре заказчика форма входа не должна подсказывать логин и пароль.
+  const [email, setEmail] = useState(edition.demo ? "admin@earchive.kz" : "");
+  const [password, setPassword] = useState(edition.demo ? "admin12345" : "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   // Второй фактор (п. 3.3 ТС): challenge выдаётся при входе с нового
   // устройства либо при наличии второй активной сессии.
   const [challenge, setChallenge] = useState(null);
   const [code, setCode] = useState("");
+  // Вход по биометрии (разд. 14 п. 4.2) — если включён на сервере и браузер
+  // поддерживает ключи доступа.
+  const [passkeyReady, setPasskeyReady] = useState(false);
 
   useEffect(() => {
     if (user) navigate("/", { replace: true });
   }, [user, navigate]);
+
+  useEffect(() => {
+    if (!passkeysSupported()) return;
+    api.passkeyStatus().then((s) => setPasskeyReady(Boolean(s.enabled))).catch(() => {});
+  }, []);
 
   async function onSubmit(e) {
     e.preventDefault();
@@ -51,14 +65,27 @@ export default function Login() {
     }
   }
 
+  async function onPasskey() {
+    setError("");
+    setBusy(true);
+    try {
+      await loginWithPasskey();
+      navigate("/", { replace: true });
+    } catch (err) {
+      setError(passkeyErrorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="login-wrap">
       <div className="login-card">
         <div className="brand big">
-          <span className="brand-mark">e</span>
+          <span className="brand-mark">{edition.mark}</span>
           <div>
-            <div className="brand-name">e-archive</div>
-            <div className="brand-sub">Электронный архив · AI-поиск · ЭЦП РК</div>
+            <div className="brand-name">{edition.product}</div>
+            <div className="brand-sub">{edition.tagline || edition.subtitle}</div>
           </div>
         </div>
 
@@ -66,15 +93,25 @@ export default function Login() {
           <>
             <form onSubmit={onSubmit}>
               <label>Email</label>
-              <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" required />
+              <input value={email} onChange={(e) => setEmail(e.target.value)} type="email"
+                     autoComplete="username webauthn" required />
               <label>Пароль</label>
-              <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" required />
+              <input value={password} onChange={(e) => setPassword(e.target.value)} type="password"
+                     autoComplete="current-password" required />
               {error && <div className="alert error">{error}</div>}
               <button className="btn primary block" disabled={busy}>
                 {busy ? "Вход…" : "Войти"}
               </button>
             </form>
-            <div className="login-hint">По умолчанию: admin@earchive.kz / admin12345</div>
+            {passkeyReady && (
+              <button className="btn ghost block" style={{ marginTop: 10 }}
+                      disabled={busy} onClick={onPasskey}>
+                🔑 Войти по биометрии
+              </button>
+            )}
+            {edition.demo && (
+              <div className="login-hint">По умолчанию: admin@earchive.kz / admin12345</div>
+            )}
           </>
         ) : (
           <>

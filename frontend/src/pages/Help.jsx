@@ -76,6 +76,78 @@ const SECTIONS = [
   },
 ];
 
+import { useEffect, useState } from "react";
+import { api } from "../api.js";
+
+// Обращение в службу поддержки (ТЗ АГП п. 8, модуль «Помощь»).
+function SupportForm() {
+  const [form, setForm] = useState({ subject: "", body: "" });
+  const [tickets, setTickets] = useState([]);
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState("");
+
+  function load() {
+    api.listTickets({ mine: true }).then(setTickets).catch(() => {});
+  }
+  useEffect(load, []);
+
+  async function submit(e) {
+    e.preventDefault();
+    setError("");
+    try {
+      await api.createTicket(form);
+      setForm({ subject: "", body: "" });
+      setSent(true);
+      load();
+    } catch (e2) { setError(e2.message); }
+  }
+
+  return (
+    <div className="card dash-card wide" style={{ marginTop: 18 }}>
+      <h3 style={{ marginTop: 0 }}>Обращение в службу поддержки</h3>
+      <p className="muted">
+        Опишите ошибку или вопрос — обращение попадёт администратору системы.
+        Для инцидентов информационной безопасности укажите в теме пометку
+        «инцидент ИБ».
+      </p>
+      {error && <div className="alert error">{error}</div>}
+      {sent && <div className="alert success">Обращение зарегистрировано.</div>}
+      <form className="form" onSubmit={submit}>
+        <label>Тема</label>
+        <input value={form.subject} required
+               onChange={(e) => setForm({ ...form, subject: e.target.value })}
+               placeholder="кратко о проблеме" />
+        <label>Описание</label>
+        <textarea rows={4} value={form.body}
+                  onChange={(e) => setForm({ ...form, body: e.target.value })}
+                  placeholder="что произошло, в каком разделе, что ожидалось" />
+        <button className="btn primary" style={{ marginTop: 12 }}>Отправить</button>
+      </form>
+
+      {tickets.length > 0 && (
+        <>
+          <h4 style={{ marginBottom: 6 }}>Мои обращения</h4>
+          <table className="grid">
+            <thead>
+              <tr><th>Дата</th><th>Тема</th><th>Статус</th><th>Ответ</th></tr>
+            </thead>
+            <tbody>
+              {tickets.map((t) => (
+                <tr key={t.id}>
+                  <td className="muted">{new Date(t.created_at).toLocaleDateString("ru-RU")}</td>
+                  <td>{t.subject}</td>
+                  <td><span className="type-tag">{t.status}</span></td>
+                  <td className="muted">{t.answer || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function Help() {
   return (
     <div className="page">
@@ -106,14 +178,7 @@ export default function Help() {
         </ul>
       </div>
 
-      <div className="card dash-card wide" style={{ marginTop: 18 }}>
-        <h3 style={{ marginTop: 0 }}>Поддержка</h3>
-        <p className="muted" style={{ marginBottom: 0 }}>
-          При обнаружении ошибки или инцидента информационной безопасности
-          направьте описание в службу поддержки. Для инцидентов ИБ укажите
-          в теме письма пометку «инцидент ИБ».
-        </p>
-      </div>
+      <SupportForm />
     </div>
   );
 }

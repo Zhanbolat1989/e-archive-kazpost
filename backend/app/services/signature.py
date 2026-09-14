@@ -125,3 +125,85 @@ def verify_cms(cms_base64: str, content: bytes | None = None) -> VerifyResult:
         return VerifyResult(
             SignatureStatus.invalid, identity, f"Подпись недействительна: {exc}"
         )
+
+
+def content_matches(cms_base64: str, expected: bytes) -> tuple[bool, str]:
+    """Относится ли подпись именно к ожидаемому содержимому.
+
+    verify_cms проверяет подпись над подписанными атрибутами, но не то, ЧТО
+    подписано: CMS с чужим вложенным содержимым и корректной подписью её
+    прошла бы. Там, где подпись должна быть привязана к конкретному файлу
+    (удостоверение электронной копии), сверяются вложенное содержимое и
+    атрибут messageDigest."""
+    try:
+        signed_data = cms.ContentInfo.load(base64.b64decode(cms_base64))["content"]
+        encap = signed_data["encap_content_info"]["content"].native
+        signers = signed_data["signer_infos"]
+    except Exception as exc:  # noqa: BLE001
+        return False, f"подпись не разобрана: {exc}"
+    if encap is None:
+        return False, "подпись откреплённая — подписанное содержимое не вложено"
+    if encap != expected:
+        return False, "подписано другое содержимое"
+    if not len(signers):
+        return False, "в подписи нет данных подписанта"
+    signer = signers[0]
+    attrs = signer["signed_attrs"]
+    if attrs.native is None:
+        # Без подписанных атрибутов подпись вычислена прямо над содержимым,
+        # и его совпадение уже проверено.
+        return True, ""
+    for attr in attrs:
+        if attr["type"].native != "message_digest":
+            continue
+        hash_cls = _DIGEST.get(signer["digest_algorithm"]["algorithm"].native)
+        if hash_cls is None:
+            # ГОСТ-хэш здесь не вычисляется: совпадение содержимого проверено
+            # выше, а дайджест сверяет проверка подписи по ГОСТ.
+            return True, ""
+        h = hashes.Hash(hash_cls())
+        h.update(expected)
+        if attr["values"][0].native != h.finalize():
+            return False, "дайджест в подписи не совпадает с содержимым"
+        return True, ""
+    return False, "в подписи нет атрибута messageDigest"
+
+
+def _encapsulated(cms_base64: str) -> bytes | None:
+    """Вложенное в CMS содержимое; None — подпись откреплённая или не разобрана."""
+    try:
+        info = cms.ContentInfo.load(base64.b64decode(cms_base64))
+        return info["content"]["encap_content_info"]["content"].native
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def verify(cms_base64: str, content: bytes | None = None) -> VerifyResult:
+    """Проверка ЭЦП выбранным способом (SIGNATURE_VERIFIER).
+
+    ncanode — по Правилам № 1187: ГОСТ 34.10-2015, цепочка до корня НУЦ РК,
+    отзыв сертификата. local — встроенная проверка RSA без цепочки и отзыва.
+    Содержимое передаётся на проверку только для откреплённой подписи: у
+    прикреплённой подписано вложенное содержимое, а не файл документа."""
+    from ..config import settings
+
+    if settings.SIGNATURE_VERIFIER == "ncanode":
+        from . import ncanode
+
+        detached = _encapsulated(cms_base64) is None
+        return ncanode.verify_cms(cms_base64, content if detached else None)
+    return verify_cms(cms_base64, content=content)
+
+
+def is_confirmed(result: VerifyResult) -> bool:
+    """Подтверждена ли подпись настолько, чтобы удостоверять ею документ.
+
+    При проверке через NCANode — только действительная. Встроенная проверка
+    ГОСТ не выполняет вовсе, и там допускается «не поддерживается» с извлечённой
+    личностью подписанта: иначе в контуре без NCANode удостоверить копию было бы
+    невозможно ни одной подписью НУЦ."""
+    from ..config import settings
+
+    if result.status == SignatureStatus.valid:
+        return True
+    return settings.SIGNATURE_VERIFIER == "local" and result.status == SignatureStatus.unsupported

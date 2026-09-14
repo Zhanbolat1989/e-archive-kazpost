@@ -115,6 +115,84 @@ def get_current_user(
     return user
 
 
+# ---- Ключи доступа внешних информационных систем (ТЗ АГП п. 7, 9) ----
+API_KEY_HEADER = "X-API-Key"
+API_KEY_PREFIX_LEN = 8
+
+
+def hash_api_key(key: str) -> str:
+    """SHA-256, а не bcrypt: ключ — случайные 32 байта, подбирать его перебором
+    бессмысленно, а проверка выполняется на каждом запросе внешней системы и
+    должна быть быстрой."""
+    import hashlib
+
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def generate_api_key() -> tuple[str, str, str]:
+    """(ключ, префикс, хэш). Ключ показывается владельцу один раз."""
+    import secrets
+
+    key = "ea_" + secrets.token_urlsafe(32)
+    return key, key[:API_KEY_PREFIX_LEN], hash_api_key(key)
+
+
+def _api_key_user(db: Session, raw: str) -> Optional[User]:
+    """Пользователь, от имени которого действует внешняя система.
+
+    Объект User создаётся в памяти и не сохраняется: у ключа нет учётной записи,
+    но аудиту нужен идентификатор действующего лица, а проверке доступа — роль.
+    """
+    from .models import ApiKey
+
+    key = (db.query(ApiKey)
+           .filter(ApiKey.prefix == raw[:API_KEY_PREFIX_LEN],
+                   ApiKey.revoked_at.is_(None))
+           .first())
+    if key is None or not secrets_compare(key.key_hash, hash_api_key(raw)):
+        return None
+    try:
+        key.last_used_at = datetime.utcnow()
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+    return User(id=key.id, email=f"api:{key.name}", full_name=key.name,
+                role=key.role, is_active=True, hashed_password="")
+
+
+def secrets_compare(a: str, b: str) -> bool:
+    import secrets as _s
+
+    return _s.compare_digest(a or "", b or "")
+
+
+def get_api_or_user(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> User:
+    """Доступ по ключу внешней системы либо по обычному токену пользователя.
+
+    Ключ проверяется первым: у внешней интеграции нет сессии, и требовать от
+    неё вход по паролю нельзя. Если ключа нет — работает обычная проверка
+    токена со всеми её правилами (активная сессия, блокировка учётной записи).
+    """
+    raw = request.headers.get(API_KEY_HEADER)
+    if raw:
+        user = _api_key_user(db, raw)
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="Ключ доступа недействителен")
+        return user
+    token = request.headers.get("authorization", "")
+    if not token.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Не удалось проверить учётные данные",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return get_current_user(request, token.split(" ", 1)[1], db)
+
+
 def require_roles(*roles: Role):
     def checker(user: User = Depends(get_current_user)) -> User:
         if roles and user.role not in roles:

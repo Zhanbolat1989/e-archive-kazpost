@@ -26,6 +26,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# Приложение работает от непривилегированного пользователя: при компрометации
+# процесса (обработка чужих файлов, распознавание, генерация PDF) права root
+# в контейнере дали бы лишний рычаг для выхода за его пределы.
+RUN useradd --create-home --uid 10001 app \
+    && mkdir -p /home/app/.cache \
+    && chown -R app:app /app /home/app
+USER app
+ENV HOME=/home/app
+
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

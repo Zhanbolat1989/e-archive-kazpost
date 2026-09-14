@@ -5,27 +5,30 @@ from datetime import datetime
 
 from fastapi import (
     APIRouter, Depends, UploadFile, File, Form, HTTPException, BackgroundTasks,
-    Request,
+    Query, Request,
 )
 from fastapi.responses import StreamingResponse
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from datetime import date as _date
+from datetime import date as _date, timedelta
 
 from ..autonumber import is_internal_type, next_document_number
 from ..db import get_db
 from ..models import (
     User, Role, Document, DocStatus, DocType, DOC_TYPE_GROUPS, Case, RegCard,
-    DestructionActItem, AuditLog, AuditActionType,
+    DestructionActItem, AuditLog, AuditActionType, ExtractedEntity, ChangeHistory,
+    ArchiveRequestItem,
 )
 from ..retention import rule_for, compute_until
 from ..schemas import (
     DocumentOut, DocumentDetail, DocumentUpdate, DocumentHistory, DocumentHistoryItem,
 )
 from ..security import get_current_user, require_roles
-from ..services import storage, search, audit
+from ..services import storage, search, audit, access, history
+from ..services import ecopies as ecopy_rules
 from ..services import forms as forms_svc
-from ..ingest import process_document
+from ..ingest import process_document, _index_payload
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -48,23 +51,27 @@ def _parse_date(value: str):
         return None
 
 
-def _create_document(
-    db: Session, user: User, file: UploadFile, *,
-    title: str, description: str, fond: str, opis: str, delo: str,
-    doc_type: str, doc_number: str, counterparty: str, doc_date: str,
-    amount: str, currency: str, case_id: str,
+def create_document_record(
+    db: Session, user: User, *,
+    data: bytes, filename: str, content_type: str,
+    title: str, description: str = "", fond: str = "", opis: str = "", delo: str = "",
+    doc_type: str = "", doc_number: str = "", counterparty: str = "", doc_date: str = "",
+    amount: str = "", currency: str = "KZT", case_id: str = "",
     cadastral_number: str = "", real_estate_address: str = "",
-    real_estate_area: str = "", replaces: Document | None = None,
-) -> tuple[Document, bytes]:
-    """Общая логика создания записи документа — используется и приёмом нового
-    файла, и заменой существующего документа новой версией (supersede)."""
-    data = file.file.read()
+    real_estate_area: str = "", department_id: str = "",
+    replaces: Document | None = None, copy_status: str = "",
+) -> Document:
+    """Общая логика создания записи документа — используется приёмом файла,
+    заменой документа новой версией (supersede) и модулем импорта.
+
+    Принимает именно байты, а не UploadFile: импорт читает файлы из ZIP-пакета,
+    и заворачивать их в объект загрузки только ради этой функции не нужно."""
     if not data:
         raise HTTPException(status_code=400, detail="Пустой файл")
 
     checksum = hashlib.sha256(data).hexdigest()
     doc_id = str(uuid.uuid4())
-    storage_key = f"{datetime.utcnow():%Y/%m}/{doc_id}/{file.filename}"
+    storage_key = f"{datetime.utcnow():%Y/%m}/{doc_id}/{filename}"
 
     try:
         amount_val = float(amount) if amount.strip() else None
@@ -105,7 +112,7 @@ def _create_document(
 
     doc = Document(
         id=doc_id,
-        title=title or file.filename,
+        title=title or filename,
         description=description,
         fond=fond,
         opis=opis,
@@ -125,13 +132,17 @@ def _create_document(
         permanent=ret_perm,
         retention_until=compute_until(base_year, ret_years),
         replaces_id=replaces.id if replaces else None,
-        original_filename=file.filename,
-        content_type=file.content_type or "application/octet-stream",
+        department_id=(department_id.strip() or None
+                       if isinstance(department_id, str) else department_id)
+        or (replaces.department_id if replaces else None),
+        original_filename=filename,
+        content_type=content_type or "application/octet-stream",
         size=len(data),
         storage_key=storage_key,
         checksum_sha256=checksum,
         status=DocStatus.uploaded,
         owner_id=user.id,
+        copy_status=copy_status,
     )
     db.add(doc)
     # ЭРКК: рег. номер = индекс дела по номенклатуре + порядковый номер (№ 236).
@@ -151,6 +162,17 @@ def _create_document(
         replaces.superseded_at = datetime.utcnow().date()
     db.commit()
     db.refresh(doc)
+    return doc
+
+
+def _create_document(db: Session, user: User, file: UploadFile, **kwargs
+                     ) -> tuple[Document, bytes]:
+    """Приём загруженного файла: читает содержимое и создаёт карточку."""
+    data = file.file.read()
+    doc = create_document_record(
+        db, user, data=data, filename=file.filename,
+        content_type=file.content_type or "application/octet-stream", **kwargs,
+    )
     return doc, data
 
 
@@ -173,6 +195,9 @@ def upload_document(
     cadastral_number: str = Form(""),
     real_estate_address: str = Form(""),
     real_estate_area: str = Form(""),
+    department_id: str = Form(""),
+    # ТС-176 п. 11.6: скан бумажного документа — электронная копия
+    is_copy: bool = Form(False),
     db: Session = Depends(get_db),
     user: User = Depends(require_roles(Role.admin, Role.archivist)),
 ):
@@ -182,6 +207,8 @@ def upload_document(
         counterparty=counterparty, doc_date=doc_date, amount=amount,
         currency=currency, case_id=case_id, cadastral_number=cadastral_number,
         real_estate_address=real_estate_address, real_estate_area=real_estate_area,
+        department_id=department_id,
+        copy_status=ecopy_rules.PENDING if is_copy else "",
     )
     audit.record(db, user, "document.upload", "document", doc.id,
                  f"{doc.title} ({doc.doc_type.value})")
@@ -216,7 +243,7 @@ def supersede_document(
     прекращается). Кадастровые данные и дело наследуются от предыдущей версии,
     если не заданы явно."""
     old = db.get(Document, doc_id)
-    if not old:
+    if not old or not access.can_see(db, user, old):
         raise HTTPException(status_code=404, detail="Документ не найден")
     if old.superseded_at is not None:
         raise HTTPException(status_code=409, detail="Документ уже заменён более новой версией")
@@ -242,11 +269,11 @@ def supersede_document(
 
 @router.get("/{doc_id}/history", response_model=DocumentHistory)
 def document_history(
-    doc_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+    doc_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
     """Полная цепочка версий документа (кто кого заменил), от первой к текущей."""
     doc = db.get(Document, doc_id)
-    if not doc:
+    if not doc or not access.can_see(db, user, doc):
         raise HTTPException(status_code=404, detail="Документ не найден")
 
     # К началу цепочки
@@ -283,18 +310,58 @@ def document_history(
 
 @router.get("", response_model=list[DocumentOut])
 def list_documents(
-    skip: int = 0,
-    limit: int = 50,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    department_id: str | None = None,
+    doc_type: str | None = None,
+    doc_group: str | None = None,
+    case_id: str | None = None,
+    year: int | None = None,
+    retention: str | None = Query(None, pattern="^(permanent|expired|expiring|active)$"),
+    needs_review: bool | None = None,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
-    return (
-        db.query(Document)
-        .order_by(Document.created_at.desc())
-        .offset(skip)
-        .limit(min(limit, 200))
-        .all()
-    )
+    """Перечень документов с фильтрами модуля «Документы» (ТЗ АГП п. 8):
+    подразделение, вид документа, срок хранения и срок уничтожения.
+
+    retention: permanent — постоянного хранения; expired — срок истёк, документ
+    подлежит уничтожению; expiring — срок истекает в ближайший год; active —
+    срок ещё не подходит.
+    """
+    q = access.apply(db.query(Document), db, user)
+    if department_id:
+        q = q.filter(Document.department_id == department_id)
+    if doc_type:
+        q = q.filter(Document.doc_type == _parse_doc_type(doc_type))
+    if doc_group:
+        types = DOC_TYPE_GROUPS.get(doc_group)
+        if types is None:
+            raise HTTPException(status_code=400, detail="Неизвестная категория документов")
+        q = q.filter(Document.doc_type.in_(types))
+    if case_id:
+        q = q.filter(Document.case_id == case_id)
+    if year:
+        q = q.filter(Document.doc_date >= _date(year, 1, 1),
+                     Document.doc_date <= _date(year, 12, 31))
+    if retention:
+        today = _date.today()
+        horizon = today + timedelta(days=365)
+        if retention == "permanent":
+            q = q.filter(Document.permanent.is_(True))
+        elif retention == "expired":
+            q = q.filter(Document.permanent.is_(False), Document.destroyed_at.is_(None),
+                         Document.retention_until < today)
+        elif retention == "expiring":
+            q = q.filter(Document.permanent.is_(False), Document.retention_until >= today,
+                         Document.retention_until <= horizon)
+        else:
+            q = q.filter(Document.permanent.is_(False),
+                         or_(Document.retention_until.is_(None),
+                             Document.retention_until > horizon))
+    if needs_review is not None:
+        q = q.filter(Document.needs_review.is_(needs_review))
+    return q.order_by(Document.created_at.desc()).offset(skip).limit(limit).all()
 
 
 @router.get("/meta/types")
@@ -304,13 +371,123 @@ def document_types(_: User = Depends(get_current_user)) -> list[dict]:
             for g, items in DOC_TYPE_GROUPS.items()]
 
 
+@router.get("/meta/review")
+def review_queue(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles(Role.admin, Role.archivist)),
+) -> dict:
+    """Перечень документов, требующих ручной проверки после распознавания
+    (ТЗ АГП п. 12.5): низкая уверенность OCR, пустые страницы, дубли.
+
+    Отдаём вместе со сводкой качества: архивариусу нужно понимать не только
+    что проверять, но и насколько в целом удалась партия оцифровки."""
+    q = access.apply(db.query(Document), db, user).filter(
+        Document.destroyed_at.is_(None)
+    )
+    flagged_q = q.filter(Document.needs_review.is_(True))
+    flagged = (flagged_q
+               .order_by(Document.ocr_confidence.asc().nullsfirst(),
+                         Document.created_at.desc())
+               .limit(500).all())
+    # Сводка считается в базе: поднимать ради среднего и суммы весь архив
+    # вместе с распознанным текстом нельзя.
+    recognized, avg, pages = q.with_entities(
+        func.count(Document.ocr_confidence), func.avg(Document.ocr_confidence),
+        func.coalesce(func.sum(Document.page_count), 0),
+    ).one()
+    return {
+        # Полное число, а не длина выдачи: перечень ограничен 500 строками.
+        "total_flagged": flagged_q.count(),
+        "recognized_documents": int(recognized),
+        "average_confidence": round(float(avg), 2) if avg is not None else None,
+        "total_pages": int(pages),
+        "documents": [
+            {
+                "id": d.id, "title": d.title,
+                "doc_type": d.doc_type.value if d.doc_type else "",
+                "page_count": d.page_count,
+                "ocr_confidence": float(d.ocr_confidence) if d.ocr_confidence is not None else None,
+                "review_reason": d.review_reason,
+                "duplicate_of_id": d.duplicate_of_id,
+                "created_at": d.created_at.isoformat(),
+            }
+            for d in flagged
+        ],
+    }
+
+
+@router.post("/{doc_id}/review/accept", response_model=DocumentOut)
+def accept_review(
+    doc_id: str, request: Request, db: Session = Depends(get_db),
+    user: User = Depends(require_roles(Role.admin, Role.archivist)),
+):
+    """Ручная проверка пройдена: отметка снимается, причина сохраняется в
+    истории изменений — почему документ попадал в очередь, видно и потом."""
+    doc = db.get(Document, doc_id)
+    if not doc or not access.can_see(db, user, doc):
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    before = history.snapshot(doc, ["needs_review", "review_reason"])
+    doc.needs_review = False
+    doc.review_reason = ""
+    db.commit()
+    history.record(db, user, "document", doc.id, before,
+                   {"needs_review": False, "review_reason": ""})
+    audit.record(db, user, "document.review_accept", "document", doc.id,
+                 before.get("review_reason") or "", request=request)
+    db.refresh(doc)
+    return doc
+
+
+@router.get("/{doc_id}/entities")
+def document_entities(
+    doc_id: str, db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    """Реквизиты, извлечённые из текста, с привязкой к странице и фрагменту
+    (ТЗ АГП п. 12.1)."""
+    doc = db.get(Document, doc_id)
+    if not doc or not access.can_see(db, user, doc):
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    rows = (db.query(ExtractedEntity)
+            .filter(ExtractedEntity.document_id == doc_id)
+            .order_by(ExtractedEntity.page_no, ExtractedEntity.kind)
+            .all())
+    return [
+        {"kind": r.kind, "value": r.value, "normalized": r.normalized,
+         "page_no": r.page_no, "fragment": r.fragment, "source": r.source}
+        for r in rows
+    ]
+
+
+@router.get("/{doc_id}/changes")
+def document_changes(
+    doc_id: str, db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    """История изменений карточки: поле, прежнее и новое значение (п. 8)."""
+    doc = db.get(Document, doc_id)
+    # Прежние значения полей — те же реквизиты документа: закрытая для роли
+    # категория не должна раскрываться через историю изменений.
+    if not doc or not access.can_see(db, user, doc):
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    rows = (db.query(ChangeHistory)
+            .filter(ChangeHistory.object_type == "document",
+                    ChangeHistory.object_id == doc_id)
+            .order_by(ChangeHistory.ts.desc()).limit(200).all())
+    return [{"ts": r.ts.isoformat(), "user_email": r.user_email, "field": r.field,
+             "old_value": r.old_value, "new_value": r.new_value} for r in rows]
+
+
 @router.get("/{doc_id}", response_model=DocumentDetail)
 def get_document(
     doc_id: str, request: Request, db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     doc = db.get(Document, doc_id)
-    if not doc:
+    # Документ закрытой для роли категории отвечает так же, как отсутствующий:
+    # 403 подтвердил бы сам факт существования документа. Отказ при этом
+    # пишется в аудиторский след (попытки НСД, ТС-176 разд. 14 п. 8).
+    if not doc or not access.can_see(db, user, doc, request):
         raise HTTPException(status_code=404, detail="Документ не найден")
     # История использования документа (п. 6.3 ТС «отслеживание истории
     # использования дел/документов»): просмотр карточки — тоже использование.
@@ -321,10 +498,10 @@ def get_document(
 
 @router.get("/{doc_id}/usage")
 def document_usage(doc_id: str, db: Session = Depends(get_db),
-                   _: User = Depends(get_current_user)) -> list[dict]:
+                   user: User = Depends(get_current_user)) -> list[dict]:
     """Лист использования документа: кто и когда обращался (п. 6.3 ТС)."""
     doc = db.get(Document, doc_id)
-    if not doc:
+    if not doc or not access.can_see(db, user, doc):
         raise HTTPException(status_code=404, detail="Документ не найден")
     rows = (
         db.query(AuditLog)
@@ -352,7 +529,7 @@ def certified_copy(
     содержимое + штамп «Копия электронного документа верна» с результатом
     проверки ЭЦП и контрольной характеристикой."""
     doc = db.get(Document, doc_id)
-    if not doc or doc.status == DocStatus.infected:
+    if not doc or doc.status == DocStatus.infected or not access.can_see(db, user, doc):
         raise HTTPException(status_code=404, detail="Документ недоступен")
     if doc.destroyed_at is not None:
         raise HTTPException(status_code=410,
@@ -374,10 +551,14 @@ def certified_copy(
 
 @router.get("/{doc_id}/download")
 def download_document(
-    doc_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+    doc_id: str, request: Request, db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     doc = db.get(Document, doc_id)
-    if not doc or doc.status == DocStatus.infected:
+    # Закрытая для роли категория отвечает как отсутствующий документ — иначе
+    # ограничение доступа обходилось бы скачиванием оригинала по id. Попытка
+    # пишется в аудиторский след (ТС-176 разд. 14 п. 8).
+    if not doc or doc.status == DocStatus.infected or not access.can_see(db, user, doc, request):
         raise HTTPException(status_code=404, detail="Документ недоступен")
     if doc.destroyed_at is not None:
         raise HTTPException(status_code=410,
@@ -403,9 +584,10 @@ def update_document(
     user: User = Depends(require_roles(Role.admin, Role.archivist)),
 ):
     doc = db.get(Document, doc_id)
-    if not doc:
+    if not doc or not access.can_see(db, user, doc):
         raise HTTPException(status_code=404, detail="Документ не найден")
     changes = payload.model_dump(exclude_none=True)
+    before = history.snapshot(doc, [k for k in changes if k != "version"])
     # Оптимистичная блокировка (п. 6.4 ТС): с карточкой могут работать
     # несколько пользователей, но правка поверх чужой версии отклоняется,
     # иначе более позднее сохранение молча затирало бы чужие изменения.
@@ -419,27 +601,36 @@ def update_document(
         setattr(doc, field, value)
     doc.version = (doc.version or 1) + 1
     db.commit()
+    # История изменений по полям (п. 8) — отдельно от аудита: он фиксирует
+    # факт правки, она — что именно стало другим.
+    history.record(db, user, "document", doc.id, before, changes)
     audit.record(db, user, "document.update", "document", doc.id,
                  ", ".join(changes.keys()), request=request,
                  action_type=AuditActionType.update)
     db.refresh(doc)
     # Re-index metadata (does not touch the WORM-locked original).
     if doc.status == DocStatus.ready:
-        search.index_document(
-            {
-                "id": doc.id, "title": doc.title, "description": doc.description,
-                "ocr_text": doc.ocr_text, "fond": doc.fond, "opis": doc.opis,
-                "delo": doc.delo, "doc_type": doc.doc_type.value if doc.doc_type else "",
-                "doc_number": doc.doc_number, "counterparty": doc.counterparty,
-                "doc_date": doc.doc_date.isoformat() if doc.doc_date else None,
-                "amount": float(doc.amount) if doc.amount is not None else None,
-                "cadastral_number": doc.cadastral_number,
-                "real_estate_address": doc.real_estate_address,
-                "status": doc.status.value,
-                "created_at": doc.created_at.isoformat(),
-            }
-        )
+        search.index_document(_index_payload(doc))
     return doc
+
+
+@router.get("/{doc_id}/pdfa")
+def download_pdfa(
+    doc_id: str, db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """PDF/A с текстовым слоем — результат оцифровки по ТЗ АГП п. 3."""
+    doc = db.get(Document, doc_id)
+    if not doc or not access.can_see(db, user, doc):
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    if not doc.pdfa_key:
+        raise HTTPException(status_code=404,
+                            detail="PDF/A для документа не сформирован")
+    data = storage.get_object(doc.pdfa_key)
+    return StreamingResponse(
+        io.BytesIO(data), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{doc_id}.pdfa.pdf"'},
+    )
 
 
 @router.delete("/{doc_id}", status_code=204)
@@ -478,6 +669,20 @@ def delete_document(
         pred = db.get(Document, doc.replaces_id)
         if pred is not None:
             pred.superseded_at = None
+
+    # Снимаем ссылки, удерживаемые внешними ключами. Отметка «дубль этого
+    # документа» у других карточек теряет смысл вместе с оригиналом; позиции
+    # архивных запросов сохраняются, но без ссылки на снятый документ —
+    # иначе удаление падало бы на уровне БД.
+    db.query(Document).filter(Document.duplicate_of_id == doc_id).update(
+        {Document.duplicate_of_id: None}, synchronize_session=False
+    )
+    db.query(ExtractedEntity).filter(ExtractedEntity.document_id == doc_id).delete(
+        synchronize_session=False
+    )
+    db.query(ArchiveRequestItem).filter(ArchiveRequestItem.document_id == doc_id).update(
+        {ArchiveRequestItem.document_id: None}, synchronize_session=False
+    )
 
     db.delete(doc)  # ЭРКК снимается каскадом (Document.reg_card)
     db.commit()

@@ -1,11 +1,97 @@
 import { useEffect, useState, useCallback } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api.js";
 import { useAuth } from "../auth.jsx";
+import { createPasskey, passkeyErrorMessage, passkeysSupported } from "../webauthn.js";
 
 const ROLE_LABEL = {
-  admin: "Администратор", archivist: "Архивариус", viewer: "Читатель",
+  admin: "Администратор", archivist: "Архивариус", viewer: "Читатель", auditor: "Аудитор ИБ",
 };
+const OBJECT_LABEL = { document: "документ", case: "дело", nomenclature: "статья номенклатуры" };
 const fmtTs = (t) => (t ? new Date(t).toLocaleString("ru-RU") : "—");
+
+// Ключи доступа для входа по биометрии (ТС-176 разд. 14 п. 4.2): закрытый ключ
+// хранится в телефоне и открывается отпечатком, лицом или PIN устройства.
+function Passkeys({ onError, onInfo }) {
+  const [enabled, setEnabled] = useState(false);
+  const [rows, setRows] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const supported = passkeysSupported();
+
+  const load = useCallback(() => {
+    api.listPasskeys().then(setRows).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    api.passkeyStatus().then((s) => {
+      setEnabled(Boolean(s.enabled));
+      if (s.enabled) load();
+    }).catch(() => {});
+  }, [load]);
+
+  if (!enabled) return null;
+
+  async function add() {
+    onError(""); onInfo("");
+    setBusy(true);
+    try {
+      const { challenge_id, options } = await api.passkeyRegisterOptions();
+      const credential = await createPasskey(options);
+      const key = await api.registerPasskey(challenge_id, credential);
+      onInfo(`Устройство «${key.name}» добавлено — на нём можно входить по биометрии`);
+      load();
+    } catch (e) {
+      onError(passkeyErrorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(key) {
+    if (!confirm(`Удалить ключ «${key.name}»? Входить с этого устройства по биометрии будет нельзя.`)) return;
+    onError("");
+    try {
+      await api.deletePasskey(key.id);
+      load();
+    } catch (e) { onError(e.message); }
+  }
+
+  return (
+    <div className="card dash-card wide" style={{ marginBottom: 18 }}>
+      <h3 style={{ marginTop: 0 }}>🔑 Вход по биометрии</h3>
+      <p className="muted" style={{ marginTop: 0 }}>
+        Ключ доступа хранится в телефоне и открывается отпечатком пальца, лицом или PIN
+        устройства. Пароль при таком входе не вводится, а сам ключ устройство не покидает.
+      </p>
+      {rows.length > 0 && (
+        <table className="grid" style={{ marginBottom: 12 }}>
+          <thead>
+            <tr><th>Устройство</th><th>Добавлено</th><th>Последний вход</th><th></th></tr>
+          </thead>
+          <tbody>
+            {rows.map((k) => (
+              <tr key={k.id}>
+                <td>{k.name}{k.backed_up && <span className="muted small"> · синхронизируется</span>}</td>
+                <td className="muted">{fmtTs(k.created_at)}</td>
+                <td className="muted">{fmtTs(k.last_used_at)}</td>
+                <td><button className="btn small" onClick={() => remove(k)}>Удалить</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {supported ? (
+        <button className="btn primary" disabled={busy} onClick={add}>
+          {busy ? "Подтвердите на устройстве…" : "Добавить это устройство"}
+        </button>
+      ) : (
+        <p className="muted small" style={{ marginBottom: 0 }}>
+          Этот браузер не поддерживает ключи доступа — откройте систему в браузере телефона.
+        </p>
+      )}
+    </div>
+  );
+}
 
 export default function Account() {
   const { user, refresh } = useAuth();
@@ -82,7 +168,7 @@ export default function Account() {
             <div className="ret-row" key={a.id}>
               <span>
                 <b>{a.title}</b>
-                <span className="muted small"> · {a.object_type === "document" ? "документ" : "дело"}
+                <span className="muted small"> · {OBJECT_LABEL[a.object_type] || a.object_type}
                   {" · от "}{a.created_by}</span>
               </span>
               <span style={{ display: "flex", gap: 8 }}>
@@ -93,6 +179,21 @@ export default function Account() {
           ))}
         </div>
       )}
+
+      {/* ТС-176 разд. 14 п. 2.9, 2.10, 6.1: дополнительные услуги (интеграция с
+          SIEM, антивирусная проверка, информация о логировании) заказываются
+          заявкой в Личном кабинете. */}
+      <div className="card dash-card wide" style={{ marginBottom: 18 }}>
+        <h3 style={{ marginTop: 0 }}>🧾 Заявки и обращения</h3>
+        <p className="muted" style={{ marginTop: 0 }}>
+          Заявки на дополнительные услуги — интеграция с SIEM, антивирусная проверка
+          загружаемых файлов, информация о логировании действий пользователя — и
+          обращения в поддержку со сроками реакции и устранения.
+        </p>
+        <Link className="btn primary" to="/support">Перейти к заявкам и обращениям</Link>
+      </div>
+
+      <Passkeys onError={setError} onInfo={setInfo} />
 
       <div className="row2" style={{ alignItems: "start", gap: 18 }}>
         <form className="card form" onSubmit={saveProfile}>

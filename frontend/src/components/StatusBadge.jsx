@@ -11,7 +11,9 @@ const SIG = {
   none: null,
   valid: ["✔ ЭЦП верна", "b-green"],
   invalid: ["✖ ЭЦП неверна", "b-red"],
-  unsupported: ["ЭЦП: ГОСТ", "b-gray"],
+  // Подпись не подтверждена: ГОСТ без NCANode, сервис проверки недоступен
+  // или не получен статус отзыва сертификата (Правила № 1187).
+  unsupported: ["ЭЦП не подтверждена", "b-gray"],
 };
 
 export function StatusBadge({ status }) {

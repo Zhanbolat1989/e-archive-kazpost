@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import { api } from "../api.js";
 import { useAuth } from "../auth.jsx";
 import DocumentModal from "../components/DocumentModal.jsx";
+import ApprovalPanel from "../components/ApprovalPanel.jsx";
 import { useSort, SortTh, dateKey, PERMANENT_RANK } from "../sort.jsx";
 
 const CASE_STATUS = {
@@ -175,6 +176,13 @@ export default function Cases() {
               <div><span>Том</span>{selected.volume}</div>
             </div>
 
+            {selected.annotation && (
+              <div className="annotation">
+                <div className="annotation-label">📝 Аннотация дела (ИИ)</div>
+                <p>{selected.annotation}</p>
+              </div>
+            )}
+
             <h3 style={{ margin: "10px 0 8px" }}>Документы дела</h3>
             {selected.documents.length === 0 && (
               <p className="muted">В деле пока нет документов. Привяжите их при загрузке (Приём) или из карточки документа.</p>
@@ -196,6 +204,9 @@ export default function Cases() {
                 </div>
               ))}
             </div>
+
+            <ApprovalPanel objectType="case" objectId={selected.id}
+              canStart={canEdit && selected.status !== "Уничтожено"} />
 
             <h3 style={{ margin: "16px 0 8px" }}>Нормативные формы</h3>
             <div className="forms-grid">
@@ -228,6 +239,19 @@ export default function Cases() {
             <div className="modal-actions">
               {canEdit && selected.status === "Формируется" && (
                 <button className="btn" onClick={closeCase}>📁 Закрыть дело</button>
+              )}
+              {canEdit && selected.documents.length > 0 && (
+                <button className="btn"
+                  title="Краткое содержание дела по аннотациям его документов (ТЗ АГП п. 12.4)"
+                  onClick={async () => {
+                    setError("");
+                    try {
+                      await api.annotateCase(selected.id);
+                      openCase(selected.id);
+                    } catch (e) { setError(e.message); }
+                  }}>
+                  📝 Аннотация дела (ИИ)
+                </button>
               )}
               {canEdit && (
                 <button className="btn" title="Информационный пакет для передачи в госархив"

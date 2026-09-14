@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import Document, DocStatus, DocType
-from . import llm
+from . import cancel, grounding, llm
 from . import search as search_svc
 
 log = logging.getLogger("agent")
@@ -104,25 +104,53 @@ TOOLS = [
 ]
 
 
-def _source(doc: Document, score: float = 0.0) -> dict:
-    return {
+def _source(doc: Document, score: float = 0.0, hit: dict | None = None) -> dict:
+    """Источник ответа. Для найденного поиском документа указываются страница и
+    цитата, на которых основан ответ (ТЗ АГП п. 12.3): без них ссылка «см.
+    документ на 180 листов» проверке не поддаётся."""
+    src = {
         "id": doc.id, "title": doc.title, "fond": doc.fond,
         "opis": doc.opis, "delo": doc.delo, "score": round(float(score), 3),
     }
+    fragments = (hit or {}).get("fragments") or []
+    if fragments:
+        src["page_no"] = fragments[0].get("page_no")
+        src["fragment"] = quote(fragments[0].get("text", ""))
+    return src
 
 
-def _search_archive(query: str, db: Session, surfaced: dict) -> list[dict]:
-    hits = search_svc.search(query, mode="hybrid", size=settings.RAG_TOP_K)
+QUOTE_CHARS = 300
+
+
+def quote(text: str) -> str:
+    """Короткая цитата фрагмента — её пользователь сверяет с документом."""
+    text = " ".join((text or "").split())
+    return text[:QUOTE_CHARS] + ("…" if len(text) > QUOTE_CHARS else "")
+
+
+def _snippet(hit: dict, doc: Document, limit: int) -> str:
+    """Фрагменты, найденные поиском, а не начало документа: ответ может быть на
+    любой странице, и обрезка «первых N символов» его просто теряла."""
+    text = (hit.get("chunk_text") or "").strip()
+    if not text:
+        text = (doc.ocr_text or doc.description or "").strip()
+    return text[:limit]
+
+
+def _search_archive(query: str, db: Session, surfaced: dict,
+                    allowed: list[str] | None = None) -> list[dict]:
+    hits = search_svc.search(query, mode="hybrid", size=settings.RAG_TOP_K,
+                             allowed_types=allowed, operators=False)
     out = []
     for h in hits:
         doc = db.get(Document, h["id"])
         if not doc:
             continue
-        surfaced.setdefault(doc.id, {"src": _source(doc, h["score"]), "read": False})
+        surfaced.setdefault(doc.id, {"src": _source(doc, h["score"], h), "read": False})
         out.append({
             "document_id": doc.id,
             "title": doc.title,
-            "snippet": (doc.ocr_text or doc.description or "")[:1500],
+            "snippet": _snippet(h, doc, 1500),
         })
     return out
 
@@ -150,15 +178,23 @@ def _match_doc_type(value: str):
     return None
 
 
-def _alive_docs(db: Session):
-    """Базовый запрос по документам архива: готовые и не уничтоженные по акту."""
-    return db.query(Document).filter(
+def _alive_docs(db: Session, allowed: set | None = None):
+    """Базовый запрос по документам архива: готовые и не уничтоженные по акту.
+
+    allowed — типы документов, открытые роли пользователя (None — все). Быстрые
+    ответы считаются прямо по базе, и без этого фильтра подсчёт выдал бы число
+    документов, которых пользователю видеть не положено."""
+    q = db.query(Document).filter(
         Document.status == DocStatus.ready, Document.destroyed_at.is_(None)
     )
+    if allowed is not None:
+        q = q.filter(Document.doc_type.in_(list(allowed)))
+    return q
 
 
-def _filter_documents(args: dict, db: Session, surfaced: dict) -> dict:
-    q = _alive_docs(db)
+def _filter_documents(args: dict, db: Session, surfaced: dict,
+                      allowed: set | None = None) -> dict:
+    q = _alive_docs(db, allowed)
 
     dt = _match_doc_type(args.get("doc_type"))
     if dt is not None:
@@ -211,9 +247,12 @@ def _filter_documents(args: dict, db: Session, surfaced: dict) -> dict:
     return {"count": len(items), "total_amount": round(total_amount, 2), "documents": items}
 
 
-def _read_document(document_id: str, db: Session, surfaced: dict) -> dict:
+def _read_document(document_id: str, db: Session, surfaced: dict,
+                   allowed: set | None = None) -> dict:
     doc = db.get(Document, document_id)
-    if not doc:
+    # Закрытая для роли категория отвечает так же, как отсутствующий документ:
+    # иначе через инструмент чтения можно было бы обойти ограничение доступа.
+    if not doc or (allowed is not None and doc.doc_type not in allowed):
         return {"error": "Документ не найден"}
     surfaced[doc.id] = {"src": _source(doc), "read": True}
     return {
@@ -255,7 +294,7 @@ _SPECIFIC_MARKERS = (
 )
 
 
-def _quick_answer(question: str, db: Session) -> dict | None:
+def _quick_answer(question: str, db: Session, allowed: set | None = None) -> dict | None:
     """Return a deterministic archive summary for generic overview questions,
     computed directly from the DB (no LLM). Returns None to defer to the agent."""
     q = _norm(question)
@@ -264,7 +303,7 @@ def _quick_answer(question: str, db: Session) -> dict | None:
     if any(w in q for w in _SPECIFIC_MARKERS) or re.search(r"(19|20)\d{2}", q):
         return None  # specific question → let the tool-calling agent handle it
 
-    docs = _alive_docs(db).all()
+    docs = _alive_docs(db, allowed).all()
     if not docs:
         return {"answer": "В архиве пока нет обработанных документов.",
                 "sources": [], "steps": []}
@@ -291,6 +330,134 @@ def _quick_answer(question: str, db: Session) -> dict | None:
     }
 
 
+# ---- Быстрые ответы на элементарные вопросы (без обращения к модели) ----
+_RECENCY_TRIGGERS = ("последн", "недавн", "новы", "свеж", "перв", "стар")
+_UPLOAD_WORDS = ("загруж", "принят", "поступ", "добавл", "залит", "сохранен")
+
+
+def _fmt_dt(value) -> str:
+    return value.strftime("%d.%m.%Y") if value else "—"
+
+
+def _doc_line(d: Document, with_upload: bool = True) -> str:
+    bits = [f"«{d.title}»"]
+    if d.doc_type:
+        bits.append(d.doc_type.value)
+    if d.doc_number:
+        bits.append(f"№ {d.doc_number}")
+    if d.counterparty:
+        bits.append(d.counterparty)
+    tail = f" — принят {_fmt_dt(d.created_at)}" if with_upload else ""
+    if not with_upload and d.doc_date:
+        tail = f" — от {_fmt_dt(d.doc_date)}"
+    return " · ".join(bits) + tail
+
+
+def _recency_answer(question: str, db: Session, allowed: set | None = None) -> dict | None:
+    """«Какой документ загружен последним», «последние поступления»,
+    «самый старый документ» — считается прямо по базе, без модели."""
+    q = _norm(question)
+    if not any(t in q for t in _RECENCY_TRIGGERS):
+        return None
+    if "документ" not in q and "файл" not in q and "поступлен" not in q:
+        return None
+    # «Срок хранения истекает последним» — не про поступление, отдаём дальше.
+    if "срок" in q or "хранени" in q:
+        return None
+
+    first = any(w in q for w in ("перв", "стар"))
+    # По какой дате сортировать: дате приёма в архив или дате самого документа.
+    by_upload = any(w in q for w in _UPLOAD_WORDS) or "документ" in q and not any(
+        w in q for w in ("датирован", "по дате документа")
+    )
+    field = Document.created_at if by_upload else Document.doc_date
+    order = field.asc() if first else field.desc()
+
+    rows = _alive_docs(db, allowed).filter(field.isnot(None)).order_by(order).limit(5).all()
+    if not rows:
+        return None
+
+    many = any(w in q for w in ("последние", "недавние", "новые", "список", "какие"))
+    label = "Первый" if first else "Последний"
+    if many:
+        head = ("Первые документы архива:" if first
+                else "Последние поступления в архив:")
+        lines = [f"{i}. {_doc_line(d, by_upload)}" for i, d in enumerate(rows, 1)]
+        answer = head + "\n" + "\n".join(lines)
+        shown = rows
+    else:
+        d = rows[0]
+        answer = (f"{label} {'принятый' if by_upload else 'по дате'} документ: "
+                  f"{_doc_line(d, by_upload)}.")
+        shown = rows[:1]
+    return {
+        "answer": answer,
+        "sources": [_source(d) for d in shown],
+        "steps": [{"tool": "filter_documents",
+                   "input": "сортировка по дате " + ("приёма" if by_upload else "документа"),
+                   "summary": f"выбрано документов: {len(shown)}"}],
+    }
+
+
+_COUNT_TRIGGERS = ("сколько", "количество", "число документ")
+
+
+def _count_answer(question: str, db: Session, allowed: set | None = None) -> dict | None:
+    """«Сколько каких документов», «сколько договоров» — точный подсчёт по базе.
+
+    Отличается от общего обзора тем, что отвечает и на вопрос про конкретный
+    тип: «сколько счетов-фактур» раньше уходило в модель и отвечалось долго.
+    """
+    q = _norm(question)
+    if not any(t in q for t in _COUNT_TRIGGERS):
+        return None
+    # Суммы денег — это другой обработчик (агрегаты по контрагентам).
+    if any(w in q for w in ("сумм", "тенге", "оплач", "заплат", "стои")):
+        return None
+
+    docs = _alive_docs(db, allowed).all()
+    if not docs:
+        return {"answer": "В архиве пока нет обработанных документов.",
+                "sources": [], "steps": []}
+
+    # Спрашивают про конкретный тип? Сопоставляем по корням слов, а не по
+    # целому названию: в вопросе стоит словоформа («счетов-фактур»), которая с
+    # названием типа («Счёт-фактура») буквально не совпадает. Побеждает тип, у
+    # которого совпало больше корней, — так «Счёт-фактура» выигрывает у «Счёт».
+    # Тип считается названным, только если в вопросе есть ВСЕ корни его
+    # названия. Одного совпадения мало: слово «документов» есть и в вопросе
+    # «сколько каких документов», и в названии «Правоустанавливающий документ»,
+    # а «договоров» — и в «Договор», и в «Трудовой договор».
+    # Из подошедших берём самый специфичный — с наибольшим числом корней.
+    matched, best = None, 0
+    for dt in DocType:
+        name = _norm(dt.value)
+        stems = [w[:5] for w in re.split(r"[^а-яa-z]+", name) if len(w) >= 3]
+        if not stems or not all(s in q for s in stems):
+            continue
+        if len(stems) > best:
+            matched, best = dt, len(stems)
+    if matched is not None:
+        rows = [d for d in docs if d.doc_type == matched]
+        answer = f"Документов типа «{matched.value}» в архиве: {len(rows)}."
+        if rows:
+            recent = sorted(rows, key=lambda d: d.created_at, reverse=True)[:3]
+            answer += "\n\nПоследние:\n" + "\n".join(
+                f"• {_doc_line(d)}" for d in recent
+            )
+        return {
+            "answer": answer,
+            "sources": [_source(d) for d in rows[:5]],
+            "steps": [{"tool": "filter_documents", "input": f"тип={matched.value}",
+                       "summary": f"найдено: {len(rows)}"}],
+        }
+
+    # Тип не назван — это вопрос об архиве в целом. Отдаём его _quick_answer:
+    # там та же разбивка по типам плюс период и суммарная стоимость, и дублировать
+    # её здесь значило бы обеднить ответ на «сколько всего документов».
+    return None
+
+
 # ---- Fast path: deterministic amount aggregation (sums, totals per counterparty) ----
 def _money(x: float) -> str:
     return f"{x:,.0f}".replace(",", " ")
@@ -301,9 +468,10 @@ def _cp_tokens(cp: str) -> list[str]:
             if len(t) >= 3 and t not in _LEGAL_FORMS]
 
 
-def _match_counterparty(q: str, db: Session) -> str | None:
+def _match_counterparty(q: str, db: Session, allowed: set | None = None) -> str | None:
     """Find the known counterparty whose distinctive tokens appear in the question."""
-    rows = db.query(Document.counterparty).filter(Document.counterparty != "").distinct().all()
+    rows = (_alive_docs(db, allowed).with_entities(Document.counterparty)
+            .filter(Document.counterparty != "").distinct().all())
     best, best_score = None, 0
     for (cp,) in rows:
         present = [t for t in _cp_tokens(cp) if t in q]
@@ -319,7 +487,7 @@ _TYPE_ORDER = [DocType.payment, DocType.invoice, DocType.contract, DocType.act,
                DocType.order, DocType.reference, DocType.letter, DocType.other]
 
 
-def _aggregate_answer(question: str, db: Session) -> dict | None:
+def _aggregate_answer(question: str, db: Session, allowed: set | None = None) -> dict | None:
     """Compute sums over matching documents (e.g. total paid to a counterparty),
     grouped by type to avoid double-counting one transaction across documents."""
     q = _norm(question)
@@ -328,13 +496,13 @@ def _aggregate_answer(question: str, db: Session) -> dict | None:
     if not (is_payment or is_total):
         return None
 
-    cp = _match_counterparty(q, db)
+    cp = _match_counterparty(q, db, allowed)
     global_ok = (any(w in q for w in ("всего", "итого", "суммарн", "общая сумма", "в сумме"))
                  and ("документ" in q or "архив" in q))
     if cp is None and not global_ok:
         return None  # e.g. "сколько стоит договор аренды" → defer to the agent
 
-    query = _alive_docs(db)
+    query = _alive_docs(db, allowed)
     if cp:
         for t in _cp_tokens(cp):
             query = query.filter(Document.counterparty.ilike(f"%{t}%"))
@@ -395,11 +563,11 @@ def _aggregate_answer(question: str, db: Session) -> dict | None:
     }
 
 
-def _ready_docs_with_cp(db: Session):
-    return _alive_docs(db).filter(Document.counterparty != "").all()
+def _ready_docs_with_cp(db: Session, allowed: set | None = None):
+    return _alive_docs(db, allowed).filter(Document.counterparty != "").all()
 
 
-def _paid_period_answer(question: str, db: Session) -> dict | None:
+def _paid_period_answer(question: str, db: Session, allowed: set | None = None) -> dict | None:
     """«Сколько всего оплачено за 2021 год» — sum of payment orders in a year."""
     q = _norm(question)
     if not ("скольк" in q and any(w in q for w in ("оплач", "заплат", "потрат"))):
@@ -408,9 +576,9 @@ def _paid_period_answer(question: str, db: Session) -> dict | None:
     if not m:
         return None  # no period → cp-based handler covers it
     year = int(m.group(0))
-    cp = _match_counterparty(q, db)
+    cp = _match_counterparty(q, db, allowed)
 
-    query = _alive_docs(db).filter(
+    query = _alive_docs(db, allowed).filter(
         Document.doc_type == DocType.payment,
         extract("year", Document.doc_date) == year,
     )
@@ -435,7 +603,7 @@ def _paid_period_answer(question: str, db: Session) -> dict | None:
                        "summary": f"подсчёт по {len(docs)} платежам"}]}
 
 
-def _top_counterparties_answer(question: str, db: Session) -> dict | None:
+def _top_counterparties_answer(question: str, db: Session, allowed: set | None = None) -> dict | None:
     """«Топ контрагентов по сумме» — ranked by contracted (deal) value."""
     q = _norm(question)
     hit = (("топ" in q and ("контрагент" in q or "поставщик" in q or "сумм" in q))
@@ -443,7 +611,7 @@ def _top_counterparties_answer(question: str, db: Session) -> dict | None:
            or ("контрагент" in q and ("по сумме" in q or "больше всего" in q or "рейтинг" in q)))
     if not hit:
         return None
-    docs = _ready_docs_with_cp(db)
+    docs = _ready_docs_with_cp(db, allowed)
     if not docs:
         return None
     deal, paid = defaultdict(float), defaultdict(float)
@@ -466,7 +634,7 @@ def _top_counterparties_answer(question: str, db: Session) -> dict | None:
          "summary": f"ранжирование {len(top)} контрагентов"}]}
 
 
-def _obligations_vs_paid_answer(question: str, db: Session) -> dict | None:
+def _obligations_vs_paid_answer(question: str, db: Session, allowed: set | None = None) -> dict | None:
     """«Обязательства vs оплачено» — per-counterparty contracts vs payments."""
     q = _norm(question)
     hit = (("обязательств" in q and ("оплач" in q or "плач" in q or "vs" in q or "против" in q))
@@ -474,7 +642,7 @@ def _obligations_vs_paid_answer(question: str, db: Session) -> dict | None:
            or ("сводк" in q and ("контрагент" in q or "оплат" in q or "обязательств" in q)))
     if not hit:
         return None
-    docs = _ready_docs_with_cp(db)
+    docs = _ready_docs_with_cp(db, allowed)
     if not docs:
         return None
     contracted, paid, cps = defaultdict(float), defaultdict(float), set()
@@ -509,7 +677,7 @@ def _obligations_vs_paid_answer(question: str, db: Session) -> dict | None:
          "summary": f"сводка по {len(lines)} контрагентам"}]}
 
 
-def _retention_answer(question: str, db: Session) -> dict | None:
+def _retention_answer(question: str, db: Session, allowed: set | None = None) -> dict | None:
     """«Какие документы/дела истекают», «истёк срок хранения» — сводка по срокам."""
     q = _norm(question)
     if not (("срок" in q and ("хранен" in q or "истек" in q or "истёк" in q))
@@ -519,10 +687,8 @@ def _retention_answer(question: str, db: Session) -> dict | None:
 
     today = _d.today()
     horizon = today + _td(days=365)
-    docs = (db.query(Document)
-            .filter(Document.status == DocStatus.ready,
-                    Document.retention_until.isnot(None),
-                    Document.destroyed_at.is_(None))
+    docs = (_alive_docs(db, allowed)
+            .filter(Document.retention_until.isnot(None))
             .order_by(Document.retention_until).all())
     expired = [d for d in docs if d.retention_until < today and not d.permanent]
     expiring = [d for d in docs
@@ -555,15 +721,19 @@ def _retention_answer(question: str, db: Session) -> dict | None:
 _OWNERSHIP_TYPES = (DocType.title_deed, DocType.rights_certificate, DocType.registry_extract)
 
 
-def _real_estate_answer(question: str, db: Session) -> dict | None:
+def _real_estate_answer(question: str, db: Session, allowed: set | None = None) -> dict | None:
     """«Кто собственник объекта [кадастровый номер]», «история объекта» —
     текущий правообладатель и цепочка смены собственника по кадастровому
     номеру (правоустанавливающие/правоудостоверяющие документы)."""
     q = _norm(question)
     if not any(t in q for t in ("собственник", "правообладат", "объект недвижимост", "кадастров")):
         return None
+    # «Сколько кадастровых паспортов» — вопрос о количестве документов,
+    # а не о правах на объект: такой отдаём обработчику подсчёта.
+    if any(t in q for t in ("сколько", "количество")):
+        return None
 
-    base = _alive_docs(db).filter(Document.cadastral_number != "")
+    base = _alive_docs(db, allowed).filter(Document.cadastral_number != "")
     m = re.search(r"\d{1,3}(?::\d{1,4}){1,4}", question)
     cad = m.group(0) if m else None
     if cad:
@@ -607,22 +777,65 @@ def _real_estate_answer(question: str, db: Session) -> dict | None:
                        "summary": f"найдено документов: {len(docs)}"}]}
 
 
-def quick_answer(history: list[dict], db: Session) -> dict | None:
+def quick_answer(history: list[dict], db: Session,
+                 allowed: set | None = None) -> dict | None:
     q = _last_user(history)
-    return (_real_estate_answer(q, db)
-            or _retention_answer(q, db)
-            or _top_counterparties_answer(q, db)
-            or _obligations_vs_paid_answer(q, db)
-            or _paid_period_answer(q, db)
-            or _aggregate_answer(q, db)
-            or _quick_answer(q, db))
+    # Порядок важен: специализированные обработчики идут раньше общих, иначе
+    # обзор архива перехватил бы вопрос про конкретный тип или про последний
+    # принятый документ.
+    return (_real_estate_answer(q, db, allowed)
+            or _retention_answer(q, db, allowed)
+            or _recency_answer(q, db, allowed)
+            or _top_counterparties_answer(q, db, allowed)
+            or _obligations_vs_paid_answer(q, db, allowed)
+            or _paid_period_answer(q, db, allowed)
+            or _aggregate_answer(q, db, allowed)
+            or _count_answer(q, db, allowed)
+            or _quick_answer(q, db, allowed))
 
 
-def _retrieval_query(history: list[dict]) -> str:
-    """Combine the last two user turns so follow-ups ('а на какой срок?') still
-    retrieve the document the conversation is about."""
-    users = [m.get("content", "") for m in history if m.get("role") == "user"]
-    return " ".join(users[-2:]).strip()
+# Местоимения и указательные слова: в любом месте вопроса означают отсылку
+# к предыдущим репликам.
+_FOLLOWUP_HINTS = ("он ", "она ", "оно ", "они ", "его ", "её ", "их ", "этот",
+                   "эта ", "это ", "эти ", "там ", "тот ", "та ", "те ",
+                   "какой срок")
+# Союзы и частицы, которые указывают на продолжение диалога ТОЛЬКО в начале
+# вопроса. Внутри фразы «и» и «а» встречаются почти в каждом предложении
+# («договоры и акты»), и поиск по ним переписывал бы через модель любой вопрос.
+_FOLLOWUP_OPENERS = ("а ", "и ", "ещё", "еще", "а если", "тогда")
+# Обрывок вроде «а срок?» или «по 2023?» самостоятельным запросом не является.
+_FOLLOWUP_MAX_LEN = 25
+
+
+def _looks_like_followup(question: str, history: list[dict]) -> bool:
+    """Короткий вопрос или вопрос с местоимением сам по себе не ищется:
+    «а на какой срок?» без контекста не указывает ни на один документ.
+
+    Признак должен быть узким: переформулировка стоит отдельного обращения к
+    модели, и включать её на каждый второй вопрос диалога — значит удваивать
+    время ответа там, где вопрос и так самодостаточен."""
+    users = [m for m in history if m.get("role") == "user"]
+    if len(users) < 2:
+        return False
+    q = question.strip().lower()
+    if len(q) < _FOLLOWUP_MAX_LEN:
+        return True
+    if any(q.startswith(h) for h in _FOLLOWUP_OPENERS):
+        return True
+    return any(q.startswith(h) or f" {h}" in q for h in _FOLLOWUP_HINTS)
+
+
+def _retrieval_query(history: list[dict], steps: list[dict] | None = None) -> str:
+    """Запрос для поиска. Уточняющий вопрос переписывается моделью в
+    самостоятельный; для обычного вопроса лишний вызов LLM не делается."""
+    question = _last_user(history)
+    if not settings.RAG_QUERY_REWRITE or not _looks_like_followup(question, history):
+        return question
+    rewritten = llm.rewrite_query(history, question)
+    if steps is not None and _norm(rewritten) != _norm(question):
+        steps.append({"tool": "rewrite_query", "input": question,
+                      "summary": f"уточняющий вопрос переписан: «{rewritten}»"})
+    return rewritten
 
 
 _UNANSWERED_MARKERS = ("не найден", "нет информации", "не содержит", "не удалось",
@@ -635,38 +848,75 @@ def _looks_unanswered(answer: str) -> bool:
 
 
 def _rag_fallback(query: str, question: str, db: Session,
-                  surfaced: dict, steps: list[dict]) -> str:
+                  surfaced: dict, steps: list[dict],
+                  request_id: str | None = None,
+                  meta: dict | None = None,
+                  allowed: list[str] | None = None) -> str:
     """Deterministic retrieve-then-answer. `query` seeds retrieval (uses dialog
     context); `question` is what the model actually answers. Reliable path used
     when the tool-calling loop yields no real answer."""
-    hits = search_svc.search(query, mode="hybrid", size=settings.RAG_TOP_K)
+    meta = {} if meta is None else meta
+    hits = search_svc.search(query, mode="hybrid", size=settings.RAG_TOP_K,
+                             allowed_types=allowed, operators=False)
     if not any(s["tool"] == "search_archive" for s in steps):
         steps.append({"tool": "search_archive", "input": query,
                       "summary": f"поиск: {len(hits)} документов"})
+    # Отсечка по релевантности: слабые совпадения не помогают ответить, но
+    # разбавляют контекст и провоцируют модель отвечать «по мотивам».
+    top = hits[0]["score"] if hits else 0.0
     contexts = []
     for h in hits:
+        if top > 0 and h["score"] < settings.RAG_MIN_SCORE_RATIO * top:
+            continue
         doc = db.get(Document, h["id"])
         if not doc:
             continue
-        text = (doc.ocr_text or doc.description or "").strip()[: settings.RAG_CONTEXT_CHARS]
+        text = _snippet(h, doc, settings.RAG_CONTEXT_CHARS)
         if not text:
             continue
         # Only surface docs that also enter `contexts`, so the [n] the model
         # emits (numbered over contexts) stays aligned with the source order.
-        surfaced.setdefault(doc.id, {"src": _source(doc, h["score"]), "read": False})
-        contexts.append({"title": doc.title, "text": text})
+        surfaced.setdefault(doc.id, {"src": _source(doc, h["score"], h), "read": False})
+        contexts.append({"title": doc.title, "text": text,
+                         "pages": h.get("pages") or []})
     if not contexts:
         return "В архиве нет информации по этому вопросу."
-    return llm.answer(question, contexts)
+    cancel.check(request_id)
+    answer = llm.answer(question, contexts, should_cancel=cancel.checker(request_id))
+
+    # Сверяем числа ответа с текстом, который был отдан модели: неверно
+    # названная сумма или год выглядят достовернее, чем «не найдено», и потому
+    # опаснее. Ответ не подменяем — сообщаем о расхождении и снижаем уверенность.
+    check = grounding.check(answer, contexts, sources_count=len(contexts))
+    top = hits[0]["score"] if hits else 0.0
+    # Результат кладём в переданную структуру запроса, а не в модульную
+    # переменную: запросы обрабатываются в разных потоках и затирали бы друг друга.
+    meta["grounding"] = dict(check, confidence=grounding.confidence(check, top))
+    if check["unsupported"] or check["bad_citations"]:
+        steps.append({
+            "tool": "grounding_check",
+            "input": f"проверено чисел: {check['checked']}",
+            "summary": ("не подтверждены документами: "
+                        + ", ".join(check["unsupported"][:5])
+                        if check["unsupported"] else "неверные ссылки на источники"),
+        })
+        answer += grounding.WARNING
+    return answer
 
 
 def _run_tool_loop(history: list[dict], db: Session, surfaced: dict,
-                   steps: list[dict]) -> str:
+                   steps: list[dict], request_id: str | None = None,
+                   allowed: list[str] | None = None) -> str:
     """Autonomous tool-calling loop. Reliable only with capable models (7b+);
     for smaller models the caller falls back to seeded RAG."""
+    allowed_set = ({dt for dt in DocType if dt.value in set(allowed)}
+                   if allowed is not None else None)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
     for _ in range(MAX_STEPS):
-        msg = llm.chat(messages, tools=TOOLS)
+        # Отмена проверяется на каждом витке: цикл может сделать несколько
+        # обращений к модели, и ждать их все после нажатия «Стоп» незачем.
+        msg = llm.chat(messages, tools=TOOLS,
+                       should_cancel=cancel.checker(request_id))
         messages.append(msg)
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
@@ -677,17 +927,17 @@ def _run_tool_loop(history: list[dict], db: Session, surfaced: dict,
             args = _parse_args(fn.get("arguments"))
             if name == "search_archive":
                 q = args.get("query", "")
-                result = _search_archive(q, db, surfaced)
+                result = _search_archive(q, db, surfaced, allowed)
                 steps.append({"tool": "search_archive", "input": q,
                               "summary": f"найдено документов: {len(result)}"})
             elif name == "filter_documents":
-                result = _filter_documents(args, db, surfaced)
+                result = _filter_documents(args, db, surfaced, allowed_set)
                 crit = ", ".join(f"{k}={v}" for k, v in args.items() if v not in (None, ""))
                 steps.append({"tool": "filter_documents", "input": crit or "все",
                               "summary": f"найдено: {result['count']}"})
             elif name == "read_document":
                 did = args.get("document_id", "")
-                result = _read_document(did, db, surfaced)
+                result = _read_document(did, db, surfaced, allowed_set)
                 steps.append({"tool": "read_document", "input": result.get("title", did),
                               "summary": "прочитан документ"})
             else:
@@ -697,7 +947,8 @@ def _run_tool_loop(history: list[dict], db: Session, surfaced: dict,
     return ""
 
 
-def run(history: list[dict], db: Session) -> dict:
+def run(history: list[dict], db: Session, request_id: str | None = None,
+        allowed: list[str] | None = None) -> dict:
     """history: cleaned [{role, content}] conversation (no tool internals).
     Returns {answer, sources, steps}.
 
@@ -707,23 +958,29 @@ def run(history: list[dict], db: Session) -> dict:
     letting capable models drive the tools themselves."""
     surfaced: dict = {}
     steps: list[dict] = []
+    meta: dict = {}
     answer = ""
 
     if settings.AGENT_TOOL_LOOP:
-        answer = _run_tool_loop(history, db, surfaced, steps)
+        answer = _run_tool_loop(history, db, surfaced, steps, request_id, allowed)
 
+    cancel.check(request_id)
     if _looks_unanswered(answer) or not steps:
         answer = _rag_fallback(
-            _retrieval_query(history), _last_user(history), db, surfaced, steps
+            _retrieval_query(history, steps), _last_user(history), db, surfaced,
+            steps, request_id, meta, allowed,
         )
 
-    return _package(answer, surfaced, steps)
+    return _package(answer, surfaced, steps, meta)
 
 
-def _package(answer: str, surfaced: dict, steps: list[dict]) -> dict:
+def _package(answer: str, surfaced: dict, steps: list[dict],
+             meta: dict | None = None) -> dict:
+    confidence = (meta or {}).get("grounding", {}).get("confidence")
     if "нет информации по этому вопросу" in answer.lower():
+        # Отказ — достоверный ответ: система честно сообщает, что данных нет.
         return {"answer": "В архиве нет информации по этому вопросу.",
-                "sources": [], "steps": steps}
+                "sources": [], "steps": steps, "confidence": "high"}
 
     ordered = list(surfaced.values())  # insertion order == citation order [n]
 
@@ -731,7 +988,8 @@ def _package(answer: str, surfaced: dict, steps: list[dict]) -> dict:
     cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", answer)})
     cited_sources = [ordered[n - 1]["src"] for n in cited if 1 <= n <= len(ordered)]
     if cited_sources:
-        return {"answer": answer, "sources": cited_sources[:5], "steps": steps}
+        return {"answer": answer, "sources": cited_sources[:5], "steps": steps,
+                "confidence": confidence}
 
     # No citations: prefer documents the agent read, else relevant search hits.
     read = [v["src"] for v in ordered if v["read"]]
@@ -742,4 +1000,5 @@ def _package(answer: str, surfaced: dict, steps: list[dict]) -> dict:
         top = vals[0]["src"]["score"] if vals else 0.0
         sources = ([v["src"] for v in vals if v["src"]["score"] >= 0.3 * top]
                    if top > 0 else [v["src"] for v in vals[:1]])
-    return {"answer": answer, "sources": sources[:5], "steps": steps}
+    return {"answer": answer, "sources": sources[:5], "steps": steps,
+            "confidence": confidence}

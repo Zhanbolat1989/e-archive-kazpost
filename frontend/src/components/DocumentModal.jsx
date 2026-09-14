@@ -1,7 +1,9 @@
 import { useState, useEffect } from "react";
 import { api } from "../api.js";
+import { useAuth } from "../auth.jsx";
 import { signCms } from "../ncalayer.js";
 import { StatusBadge, SignatureBadge } from "./StatusBadge.jsx";
+import ApprovalPanel from "./ApprovalPanel.jsx";
 
 function b64(bytes) {
   let binary = "";
@@ -11,7 +13,43 @@ function b64(bytes) {
 
 const fmtD = (d) => (d ? new Date(d).toLocaleDateString("ru-RU") : "—");
 
+// Виды реквизитов, извлекаемых из текста (ТЗ АГП п. 12.1).
+const ENTITY_LABELS = {
+  date: "дата",
+  reg_number: "номер",
+  organization: "организация",
+  person: "персона",
+  amount: "сумма",
+  geo: "география",
+  doc_ref: "ссылка на документ",
+  bin: "БИН",
+  iin: "ИИН",
+};
+
+// Электронная копия и результат сверки с подлинником (ТС-176 п. 11.6–11.7).
+const COPY_LABELS = {
+  pending: "сверка с подлинником не проводилась",
+  certified: "сверена с подлинником и удостоверена ЭЦП",
+  mismatch: "отрицательный результат сверки — к уничтожению по акту",
+  no_original: "подлинник отсутствует — к уничтожению по акту",
+};
+const COPY_BADGE = {
+  pending: "b-gray", certified: "b-green", mismatch: "b-red", no_original: "b-amber",
+};
+
+function pickCopy(d) {
+  return {
+    copy_status: d.copy_status || "",
+    copy_signer: d.copy_signer || "",
+    copy_note: d.copy_note || "",
+    copy_checked_by: d.copy_checked_by || "",
+    copy_checked_at: d.copy_checked_at || null,
+  };
+}
+
 export default function DocumentModal({ doc, onClose, onChanged, canDelete, onOpenDocument }) {
+  const { user } = useAuth();
+  const canEdit = ["admin", "archivist"].includes(user?.role);
   const [sig, setSig] = useState(null);
   const [signing, setSigning] = useState(false);
   const [sigError, setSigError] = useState("");
@@ -25,11 +63,25 @@ export default function DocumentModal({ doc, onClose, onChanged, canDelete, onOp
   const [supersedeBusy, setSupersedeBusy] = useState(false);
   const [supersedeError, setSupersedeError] = useState("");
   const [deleteError, setDeleteError] = useState("");
+  const [entities, setEntities] = useState([]);
+  const [copy, setCopy] = useState(() => pickCopy(doc));
+  const [copyBusy, setCopyBusy] = useState(false);
+  const [copyError, setCopyError] = useState("");
 
   useEffect(() => {
     setHistory(null);
     api.documentHistory(doc.id).then(setHistory).catch(() => setHistory(null));
   }, [doc.id]);
+
+  useEffect(() => {
+    setEntities([]);
+    api.documentEntities(doc.id).then(setEntities).catch(() => setEntities([]));
+  }, [doc.id]);
+
+  useEffect(() => {
+    setCopy(pickCopy(doc));
+    setCopyError("");
+  }, [doc]);
 
   async function verifyEcp() {
     setSigError("");
@@ -46,6 +98,36 @@ export default function DocumentModal({ doc, onClose, onChanged, canDelete, onOp
     } finally {
       setSigning(false);
     }
+  }
+
+  async function copyAction(run) {
+    setCopyError("");
+    setCopyBusy(true);
+    try {
+      setCopy(pickCopy(await run()));
+      onChanged?.();
+    } catch (err) {
+      setCopyError(err.message);
+    } finally {
+      setCopyBusy(false);
+    }
+  }
+
+  function certifyCopy() {
+    copyAction(async () => {
+      // Подписывается контрольная характеристика файла: сервер проверит, что
+      // подпись относится именно к этой копии.
+      const cms = await signCms(b64(new TextEncoder().encode(doc.checksum_sha256)));
+      return api.certifyCopy(doc.id, cms);
+    });
+  }
+
+  function rejectCopy(result) {
+    const note = prompt(result === "no_original"
+      ? "Примечание: где и когда искали подлинник"
+      : "Примечание: в чём копия расходится с подлинником");
+    if (note === null) return;
+    copyAction(() => api.reconcileCopy(doc.id, result, note));
   }
 
   async function remove() {
@@ -104,6 +186,11 @@ export default function DocumentModal({ doc, onClose, onChanged, canDelete, onOp
         <div className="badges">
           <StatusBadge status={doc.status} />
           <SignatureBadge status={doc.signature_status} />
+          {copy.copy_status && (
+            <span className={`badge ${COPY_BADGE[copy.copy_status] || "b-gray"}`}>
+              электронная копия
+            </span>
+          )}
           {!isCurrent && (
             <span className="badge b-gray" title={`Заменён ${fmtD(doc.superseded_at)}`}>
               🔁 заменён {fmtD(doc.superseded_at)}
@@ -144,10 +231,111 @@ export default function DocumentModal({ doc, onClose, onChanged, canDelete, onOp
           <div className="alert info">{doc.status_detail}</div>
         )}
 
+        {doc.needs_review && (
+          <div className="alert info">
+            <b>Требует ручной проверки:</b> {doc.review_reason || "качество распознавания"}
+          </div>
+        )}
+
+        {/* Электронная копия бумажного документа (ТС-176 п. 11.6–11.7): сверка
+            с подлинником, удостоверение ЭЦП работника архива либо отметка
+            об отрицательном результате — основание для акта уничтожения копий. */}
+        {(copy.copy_status || canEdit) && !doc.destroyed_at && (
+          <div className="annotation">
+            <div className="annotation-label">🖨 Электронная копия</div>
+            {copy.copy_status ? (
+              <div style={{ margin: "4px 0 8px" }}>
+                <span className={`badge ${COPY_BADGE[copy.copy_status] || "b-gray"}`}>
+                  {COPY_LABELS[copy.copy_status] || copy.copy_status}
+                </span>
+                {copy.copy_signer && <div className="muted small">ЭЦП: {copy.copy_signer}</div>}
+                {copy.copy_checked_at && (
+                  <div className="muted small">{fmtD(copy.copy_checked_at)} · {copy.copy_checked_by}</div>
+                )}
+                {copy.copy_note && <div className="muted small">{copy.copy_note}</div>}
+              </div>
+            ) : (
+              <p className="muted small" style={{ margin: "4px 0 8px" }}>
+                Учитывается как электронный документ.
+              </p>
+            )}
+            {canEdit && (
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {!copy.copy_status && (
+                  <button className="btn small" disabled={copyBusy}
+                          onClick={() => copyAction(() => api.markCopy(doc.id, true))}>
+                    Отметить как электронную копию
+                  </button>
+                )}
+                {copy.copy_status === "pending" && (
+                  <>
+                    <button className="btn small primary" disabled={copyBusy} onClick={certifyCopy}>
+                      ✅ Сверено — удостоверить ЭЦП
+                    </button>
+                    <button className="btn small" disabled={copyBusy} onClick={() => rejectCopy("mismatch")}>
+                      Сверка отрицательная
+                    </button>
+                    <button className="btn small" disabled={copyBusy} onClick={() => rejectCopy("no_original")}>
+                      Подлинника нет
+                    </button>
+                    <button className="btn small ghost" disabled={copyBusy}
+                            onClick={() => copyAction(() => api.markCopy(doc.id, false))}>
+                      Это не копия
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+            {copyError && <div className="alert error">{copyError}</div>}
+          </div>
+        )}
+
         {doc.ocr_text && (
           <details className="ocr">
-            <summary>Распознанный текст (OCR) · {doc.ocr_text.length} симв.</summary>
-            <pre>{doc.ocr_text.slice(0, 4000)}</pre>
+            <summary>
+              Распознанный текст (OCR) · {doc.ocr_text.length} симв.
+              {doc.page_count ? ` · страниц: ${doc.page_count}` : ""}
+              {doc.ocr_confidence != null
+                ? ` · уверенность ${Number(doc.ocr_confidence).toFixed(0)}%`
+                : ""}
+            </summary>
+            {/* Страницы разделяются символом подачи страницы — показываем их
+                по отдельности, чтобы номер страницы совпадал со ссылками
+                ассистента (ТЗ АГП п. 12.3). */}
+            {doc.ocr_text.split("\f").slice(0, 20).map((page, i) => (
+              <div key={i}>
+                {doc.page_count > 1 && (
+                  <div className="annotation-label">Страница {i + 1}</div>
+                )}
+                <pre>{page.slice(0, 4000)}</pre>
+              </div>
+            ))}
+          </details>
+        )}
+
+        {entities.length > 0 && (
+          <details className="ocr">
+            <summary>Реквизиты, извлечённые ИИ · {entities.length}</summary>
+            <table className="grid">
+              <thead>
+                <tr><th>Реквизит</th><th>Значение</th><th>Стр.</th><th>Фрагмент</th></tr>
+              </thead>
+              <tbody>
+                {entities.map((e, i) => (
+                  <tr key={i}>
+                    <td><span className="type-tag">{ENTITY_LABELS[e.kind] || e.kind}</span></td>
+                    <td>
+                      {e.normalized}
+                      {e.normalized !== e.value && (
+                        <div className="muted small">в тексте: {e.value}</div>
+                      )}
+                    </td>
+                    <td className="num">{e.page_no}</td>
+                    <td className="muted small">{e.fragment}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </details>
         )}
 
@@ -257,6 +445,10 @@ export default function DocumentModal({ doc, onClose, onChanged, canDelete, onOp
           </form>
         )}
 
+        {/* Согласование карточки по маршруту оргструктуры (ТС-176 п. 4.10) */}
+        <ApprovalPanel objectType="document" objectId={doc.id}
+          canStart={canEdit && isCurrent && !doc.destroyed_at} />
+
         {deleteError && <div className="alert error">{deleteError}</div>}
 
         <div className="modal-actions">
@@ -269,6 +461,14 @@ export default function DocumentModal({ doc, onClose, onChanged, canDelete, onOp
           <button className="btn" onClick={verifyEcp} disabled={signing}>
             {signing ? "Подписание…" : "🔏 Подписать и проверить ЭЦП"}
           </button>
+          {doc.pdfa_key && (
+            <button className="btn"
+              title="PDF/A с текстовым слоем — результат оцифровки (ТЗ АГП п. 3)"
+              onClick={() => api.downloadBlob(`/documents/${doc.id}/pdfa`, `${doc.id}.pdfa.pdf`)
+                .catch((e) => setSigError(e.message))}>
+              📑 PDF/A с текстом
+            </button>
+          )}
           <button className="btn" title="Заверенная бумажная копия ЭД (п. 38/44 приказа № 236)"
             onClick={() => api.downloadBlob(`/documents/${doc.id}/certified-copy`, "certified_copy.pdf").catch((e) => setSigError(e.message))}>
             📄 Заверенная копия

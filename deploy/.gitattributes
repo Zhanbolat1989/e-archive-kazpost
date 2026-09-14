@@ -1,0 +1,3 @@
+# Скрипты выполняются в Linux-контейнерах: окончания строк CRLF (autocrlf на
+# Windows) ломают интерпретатор shell.
+*.sh text eol=lf

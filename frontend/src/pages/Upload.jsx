@@ -13,17 +13,23 @@ export default function Upload() {
     title: "", description: "", fond: "", opis: "", delo: "",
     doc_type: "Прочее", doc_number: "", counterparty: "", doc_date: "", amount: "",
     case_id: "", cadastral_number: "", real_estate_address: "", real_estate_area: "",
+    department_id: "", is_copy: false,
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [drag, setDrag] = useState(false);
   const [typeGroups, setTypeGroups] = useState(FALLBACK_TYPES);
   const [cases, setCases] = useState([]);
+  const [departments, setDepartments] = useState([]);
+  const [fonds, setFonds] = useState([]);
   const inputRef = useRef();
 
   useEffect(() => {
     api.documentTypes().then(setTypeGroups).catch(() => {});
     api.listCases().then((cs) => setCases(cs.filter((c) => c.status === "Формируется"))).catch(() => {});
+    api.listDepartments().then(setDepartments).catch(() => {});
+    // Справочник фондов (ТС-176 п. 4.9) — подсказки, ввод остаётся свободным.
+    api.dictionaryValues("fonds").then(setFonds).catch(() => {});
   }, []);
 
   const isRealEstate = typeGroups
@@ -152,6 +158,16 @@ export default function Upload() {
           </div>
         )}
 
+        {/* Подразделение — атрибут индексирования по ТЗ АГП п. 3 */}
+        <label>Подразделение</label>
+        <select value={meta.department_id}
+                onChange={(e) => setMeta({ ...meta, department_id: e.target.value })}>
+          <option value="">— не указано —</option>
+          {departments.map((d) => (
+            <option key={d.id} value={d.id}>{d.index ? `${d.index} · ` : ""}{d.name}</option>
+          ))}
+        </select>
+
         <label>Дело (единица хранения)</label>
         <select value={meta.case_id} onChange={(e) => setMeta({ ...meta, case_id: e.target.value })}>
           <option value="">— без дела (срок по типу документа) —</option>
@@ -162,13 +178,25 @@ export default function Upload() {
           ))}
         </select>
 
+        {/* ТС-176 п. 11.6: скан бумажного документа — электронная копия; такие
+            копии учитываются отдельной описью и сверяются с подлинником. */}
+        <label style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12 }}>
+          <input type="checkbox" style={{ width: "auto" }} checked={meta.is_copy}
+                 onChange={(e) => setMeta({ ...meta, is_copy: e.target.checked })} />
+          Электронная копия бумажного документа (скан без ЭЦП автора)
+        </label>
+
         <label>Описание</label>
         <textarea value={meta.description} onChange={(e) => setMeta({ ...meta, description: e.target.value })} rows={2} />
 
         <div className="row3">
           <div>
             <label>Фонд</label>
-            <input value={meta.fond} onChange={(e) => setMeta({ ...meta, fond: e.target.value })} placeholder="Ф-1" />
+            <input value={meta.fond} list="fonds-dictionary"
+              onChange={(e) => setMeta({ ...meta, fond: e.target.value })} placeholder="Ф-1" />
+            <datalist id="fonds-dictionary">
+              {fonds.map((f) => <option key={f} value={f} />)}
+            </datalist>
           </div>
           <div>
             <label>Опись</label>

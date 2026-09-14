@@ -4,6 +4,7 @@ from datetime import datetime, date
 
 from sqlalchemy import (
     String, Integer, DateTime, Date, ForeignKey, Text, Enum, BigInteger, Numeric,
+    JSON, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
@@ -19,6 +20,9 @@ class Role(str, enum.Enum):
     admin = "admin"          # полный доступ
     archivist = "archivist"  # приём, описание, выдача
     viewer = "viewer"        # только чтение/поиск
+    # Аудитор ИБ (ТС-176 разд. 14 п. 5.1): журналы и сессии без доступа к
+    # содержимому документов.
+    auditor = "auditor"
 
 
 class DocStatus(str, enum.Enum):
@@ -128,6 +132,53 @@ class NomenclatureItem(Base):
     permanent: Mapped[bool] = mapped_column(default=False)
     note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # --- Жизненный цикл номенклатуры (ТЗ АГП п. 8): проект → на согласовании →
+    # действующая. Строка, а не Enum: SQLAlchemy хранит у Enum имя члена, и
+    # значение по умолчанию в миграции разошлось бы с тем, что пишет ORM.
+    status: Mapped[str] = mapped_column(String(32), default="Действующая", index=True)
+    department_id: Mapped[str | None] = mapped_column(
+        ForeignKey("departments.id"), nullable=True, index=True
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=True
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # Виды документов, принимаемые в дела статьи (ТС-176 п. 4.5: ввод сканов
+    # «согласно типам документов, определённых номенклатурой дел»). Пустой
+    # список — ограничений нет.
+    doc_types: Mapped[list] = mapped_column(JSON, default=list)
+
+
+NOMENCLATURE_STATUSES = ("Проект", "На согласовании", "Действующая", "Архивная")
+
+
+# Этапы работ по делу при оцифровке архива (ТС-176 разд. 8–11) в порядке
+# выполнения. По отметкам этапов складывается объём оказанных услуг к акту.
+WORK_STAGES = {
+    "nto": "Научно-техническая обработка",
+    "expertise": "Экспертиза ценности",
+    "scanning": "Сканирование",
+    "stitching": "Прошивка и восстановление дела",
+    "digitization": "Оцифровка: распознавание, верификация, индексирование",
+}
+
+
+class CaseWorkStage(Base):
+    """Отметка выполненного этапа работ по делу: кто, когда и в каком объёме.
+
+    Одна отметка на этап дела: повторная работа правит отметку, а не удваивает
+    объём в акте оказанных услуг."""
+    __tablename__ = "case_work_stages"
+    __table_args__ = (UniqueConstraint("case_id", "stage", name="uq_case_work_stage"),)
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    stage: Mapped[str] = mapped_column(String(32), index=True)
+    pages: Mapped[int] = mapped_column(Integer, default=0)
+    completed_at: Mapped[date] = mapped_column(Date, default=date.today, index=True)
+    performed_by: Mapped[str] = mapped_column(String(255), default="")
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Case(Base):
@@ -159,6 +210,12 @@ class Case(Base):
     # Оптимистичная блокировка карточки дела (п. 6.4 ТС): одновременная работа
     # разрешена, но правка поверх чужой версии отклоняется с 409.
     version: Mapped[int] = mapped_column(Integer, default=1)
+    # Краткое содержание дела, составленное ИИ по аннотациям документов (ТЗ АГП
+    # п. 12.4: «аннотация документа или дела»).
+    annotation: Mapped[str] = mapped_column(Text, default="")
+    department_id: Mapped[str | None] = mapped_column(
+        ForeignKey("departments.id"), nullable=True, index=True
+    )
 
 
 class ActStatus(str, enum.Enum):
@@ -196,6 +253,11 @@ class DestructionAct(Base):
         Enum(ActStatus, native_enum=False, length=32), default=ActStatus.draft
     )
     note: Mapped[str] = mapped_column(Text, default="")
+    # retention — выделение к уничтожению по истечении срока хранения;
+    # ecopy — уничтожение электронных копий без подлинника или с отрицательной
+    # сверкой (ТС-176 п. 11.7), утверждается по согласованию с ЦЭК (ЭК).
+    kind: Mapped[str] = mapped_column(String(16), default="retention")
+    commission_protocol: Mapped[str] = mapped_column(String(128), default="")
     created_by: Mapped[str] = mapped_column(String(255), default="")
     approved_by: Mapped[str] = mapped_column(String(255), default="")
     approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -309,6 +371,13 @@ class Department(Base):
     )
     head_name: Mapped[str] = mapped_column(String(255), default="")
     head_position: Mapped[str] = mapped_column(String(255), default="")
+    # Руководитель как учётная запись (ТС-176 п. 4.10): его подставляют шаблоны
+    # маршрутов согласования. head_name/head_position — реквизиты печатных форм.
+    # use_alter: таблицы users и departments ссылаются друг на друга.
+    head_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", use_alter=True, name="fk_departments_head_user_id"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -325,7 +394,8 @@ class User(Base):
     department_id: Mapped[str | None] = mapped_column(
         ForeignKey("departments.id"), nullable=True, index=True
     )
-    department: Mapped["Department | None"] = relationship()
+    # foreign_keys обязателен: departments.head_user_id — второй путь между таблицами.
+    department: Mapped["Department | None"] = relationship(foreign_keys="User.department_id")
     position: Mapped[str] = mapped_column(String(255), default="")
     can_sign: Mapped[bool] = mapped_column(default=False)
     # --- п. 4.4 разд. 14: блокировка учётной записи после трёх неверных вводов ---
@@ -367,6 +437,40 @@ class LoginChallenge(Base):
     user_agent: Mapped[str] = mapped_column(String(512), default="")
 
 
+class PasskeyCredential(Base):
+    """Ключ доступа WebAuthn (ТС-176 разд. 14 п. 4.2: вход в мобильной версии по
+    биометрии). Закрытый ключ не покидает устройство; сервер хранит открытый
+    ключ и счётчик подписей (services/passkeys.py)."""
+    __tablename__ = "passkey_credentials"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    credential_id: Mapped[str] = mapped_column(String(512), unique=True, index=True)  # base64url
+    public_key: Mapped[str] = mapped_column(Text)                                      # base64url, COSE
+    sign_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    transports: Mapped[list] = mapped_column(JSON, default=list)
+    aaguid: Mapped[str] = mapped_column(String(64), default="")
+    backed_up: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class WebAuthnChallenge(Base):
+    """Одноразовый вызов WebAuthn для регистрации ключа или входа. Хранится на
+    сервере и гасится при первой попытке: подписанный ответ нельзя предъявить
+    повторно."""
+    __tablename__ = "webauthn_challenges"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    purpose: Mapped[str] = mapped_column(String(16))              # register | login
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    challenge: Mapped[str] = mapped_column(String(128))           # base64url
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class ApprovalStatus(str, enum.Enum):
     pending = "На согласовании"
     approved = "Согласовано"
@@ -382,6 +486,8 @@ class ApprovalRequest(Base):
     object_type: Mapped[str] = mapped_column(String(32), index=True)   # document | case
     object_id: Mapped[str] = mapped_column(String(64), index=True)
     title: Mapped[str] = mapped_column(String(512), default="")
+    # Шаблон, по которому построен маршрут; пусто — согласующие указаны вручную
+    template_name: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[ApprovalStatus] = mapped_column(
         Enum(ApprovalStatus, native_enum=False, length=32),
         default=ApprovalStatus.pending, index=True,
@@ -405,11 +511,47 @@ class ApprovalStep(Base):
     order_no: Mapped[int] = mapped_column(Integer, default=1)
     approver_email: Mapped[str] = mapped_column(String(255), index=True)
     approver_name: Mapped[str] = mapped_column(String(255), default="")
+    # Основание назначения по шаблону, напр. «Руководитель: Бухгалтерия»
+    basis: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[ApprovalStatus] = mapped_column(
         Enum(ApprovalStatus, native_enum=False, length=32), default=ApprovalStatus.pending
     )
     comment: Mapped[str] = mapped_column(Text, default="")
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ApprovalRouteTemplate(Base):
+    """Шаблон маршрута согласования по оргструктуре (ТС-176 п. 4.10). Шаги —
+    позиции оргструктуры {kind, value}; согласующие подставляются при запуске
+    маршрута (services/routes.py)."""
+    __tablename__ = "approval_route_templates"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(255))
+    # document | case | nomenclature; пусто — шаблон для любого объекта
+    object_type: Mapped[str] = mapped_column(String(32), default="", index=True)
+    steps: Mapped[list] = mapped_column(JSON, default=list)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class DictionaryEntry(Base):
+    """Значение редактируемого справочника (ТС-176 п. 4.9). Виды справочников —
+    в services/dictionaries.py. Значения не удаляются, а выводятся из употребления."""
+    __tablename__ = "dictionary_entries"
+    __table_args__ = (
+        UniqueConstraint("kind", "value", name="uq_dictionary_entries_kind_value"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    value: Mapped[str] = mapped_column(String(255))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Document(Base):
@@ -471,6 +613,36 @@ class Document(Base):
     destroyed_at: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     pdfa_key: Mapped[str] = mapped_column(String(1024), default="")
 
+    # --- Электронная копия (ТС-176 п. 11.6–11.7) ---
+    # Скан бумажного документа — электронная копия, а не электронный документ:
+    # ЭЦП автора у него нет. Пусто — электронный документ; иначе результат
+    # сверки с подлинником (см. services/ecopies.py).
+    copy_status: Mapped[str] = mapped_column(String(16), default="", index=True)
+    copy_checked_by: Mapped[str] = mapped_column(String(255), default="")
+    copy_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    copy_note: Mapped[str] = mapped_column(Text, default="")
+    # Кто удостоверил копию ЭЦП и где хранится сама подпись (CMS, под WORM)
+    copy_signer: Mapped[str] = mapped_column(Text, default="")
+    copy_cms_key: Mapped[str] = mapped_column(String(1024), default="")
+
+    # --- Атрибуты индексирования (ТЗ АГП п. 3): подразделение и число страниц ---
+    department_id: Mapped[str | None] = mapped_column(
+        ForeignKey("departments.id"), nullable=True, index=True
+    )
+    department: Mapped["Department | None"] = relationship()
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # --- Качество распознавания и дубли (ТЗ АГП п. 12.5) ---
+    # Средняя уверенность OCR по документу, 0–100; None — оценка не делалась
+    # (цифровой текст без распознавания).
+    ocr_confidence: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    needs_review: Mapped[bool] = mapped_column(default=False, index=True)
+    review_reason: Mapped[str] = mapped_column(String(512), default="")
+    # Документ, дублем которого признан этот (точным или почти-дублем).
+    duplicate_of_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id"), nullable=True, index=True
+    )
+
     # Замена документа новой версией (напр. смена собственника недвижимости):
     # оригинал в WORM неизменяем — вместо редактирования регистрируется новый
     # документ, а предыдущий помечается «замещён» (аналог ст. 6-7 Закона
@@ -478,7 +650,11 @@ class Document(Base):
     replaces_id: Mapped[str | None] = mapped_column(
         ForeignKey("documents.id"), nullable=True, index=True
     )
-    replaces: Mapped["Document | None"] = relationship(remote_side=[id])
+    # foreign_keys указан явно: у документа два внешних ключа на самого себя
+    # (replaces_id и duplicate_of_id), и без уточнения связь неоднозначна.
+    replaces: Mapped["Document | None"] = relationship(
+        remote_side=[id], foreign_keys=[replaces_id]
+    )
     superseded_at: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
 
     # Оптимистичная блокировка карточки документа (п. 6.4 ТС): одновременная
@@ -501,3 +677,344 @@ class Document(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
+
+
+# =============================================================================
+# ТЗ «Азиатский Газопровод»: модули п. 8 и ИИ-агент п. 12
+# =============================================================================
+
+class ExtractedEntity(Base):
+    """Реквизит, извлечённый из распознанного текста (п. 12.1): дата, номер,
+    организация, персона, сумма, географическое наименование, ссылка на другой
+    документ. Каждое значение привязано к документу, странице и фрагменту."""
+    __tablename__ = "extracted_entities"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    value: Mapped[str] = mapped_column(String(512))
+    normalized: Mapped[str] = mapped_column(String(512), default="", index=True)
+    page_no: Mapped[int] = mapped_column(Integer, default=1)
+    fragment: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(16), default="rule")   # rule | llm
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AgentLog(Base):
+    """Журнал запросов и ответов ИИ-агента для целей аудита (п. 12.6)."""
+    __tablename__ = "agent_log"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    user_email: Mapped[str] = mapped_column(String(255), index=True)
+    question: Mapped[str] = mapped_column(Text, default="")
+    answer: Mapped[str] = mapped_column(Text, default="")
+    sources: Mapped[str] = mapped_column(Text, default="[]")          # JSON
+    confidence: Mapped[str] = mapped_column(String(16), default="")
+    route: Mapped[str] = mapped_column(String(16), default="llm")      # quick | llm
+    refused: Mapped[bool] = mapped_column(default=False, index=True)
+    cancelled: Mapped[bool] = mapped_column(default=False)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+
+REQUEST_STATUSES = ("Зарегистрирован", "В работе", "Исполнен", "Отказано")
+
+
+class ArchiveRequest(Base):
+    """Архивный запрос (п. 8, модуль «Архивные запросы»): обращение за
+    сведениями или копиями документов с отслеживанием статуса исполнения."""
+    __tablename__ = "archive_requests"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    number: Mapped[str] = mapped_column(String(64), index=True)
+    reg_date: Mapped[date] = mapped_column(Date, default=date.today, index=True)
+    applicant: Mapped[str] = mapped_column(String(512))
+    applicant_contact: Mapped[str] = mapped_column(String(255), default="")
+    request_type: Mapped[str] = mapped_column(String(128), default="Тематический")
+    subject: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="Зарегистрирован", index=True)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    executor_email: Mapped[str] = mapped_column(String(255), default="")
+    response: Mapped[str] = mapped_column(Text, default="")
+    completed_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    department_id: Mapped[str | None] = mapped_column(
+        ForeignKey("departments.id"), nullable=True, index=True
+    )
+    created_by: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ArchiveRequestItem(Base):
+    """Документ или дело, использованные при исполнении запроса — основа
+    отчётности по обращениям к документам."""
+    __tablename__ = "archive_request_items"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    request_id: Mapped[str] = mapped_column(ForeignKey("archive_requests.id"), index=True)
+    document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id"), nullable=True, index=True
+    )
+    case_id: Mapped[str | None] = mapped_column(ForeignKey("cases.id"), nullable=True, index=True)
+
+
+INVENTORY_KINDS = (
+    "Постоянного хранения",
+    "Временного хранения (свыше 10 лет)",
+    "По личному составу",
+    "Временного хранения (до 10 лет)",
+)
+
+
+class Inventory(Base):
+    """Опись дел (п. 8, модуль «Описи дел»): карточка описи с перечнем дел.
+    Опись формируется автоматически по категории сроков хранения."""
+    __tablename__ = "inventories"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    number: Mapped[str] = mapped_column(String(64), index=True)
+    title: Mapped[str] = mapped_column(String(512))
+    year: Mapped[int] = mapped_column(Integer, index=True)
+    kind: Mapped[str] = mapped_column(String(64), index=True)
+    department_id: Mapped[str | None] = mapped_column(
+        ForeignKey("departments.id"), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="Проект", index=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    items: Mapped[list["InventoryItem"]] = relationship(
+        back_populates="inventory", cascade="all, delete-orphan",
+        order_by="InventoryItem.order_no",
+    )
+
+
+class InventoryItem(Base):
+    __tablename__ = "inventory_items"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    inventory_id: Mapped[str] = mapped_column(ForeignKey("inventories.id"), index=True)
+    inventory: Mapped["Inventory"] = relationship(back_populates="items")
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    case: Mapped["Case"] = relationship()
+    order_no: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class CommissionProtocol(Base):
+    """Протокол заседания экспертной комиссии (ТС-176 п. 10.2–10.5): ЭК
+    организации, ЦЭК или ЭПК уполномоченного органа. Решения по описям, актам
+    и документам НТО — в CommissionDecision (правила — services/nto.py)."""
+    __tablename__ = "commission_protocols"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    commission: Mapped[str] = mapped_column(String(8), index=True)      # ЭК | ЦЭК | ЭПК
+    number: Mapped[str] = mapped_column(String(64), index=True)
+    protocol_date: Mapped[date] = mapped_column(Date, index=True)
+    agenda: Mapped[str] = mapped_column(Text, default="")
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    decisions: Mapped[list["CommissionDecision"]] = relationship(
+        back_populates="protocol", cascade="all, delete-orphan",
+        order_by="CommissionDecision.created_at",
+    )
+
+
+class CommissionDecision(Base):
+    """Решение комиссии по объекту: описи, акту о выделении к уничтожению,
+    документу НТО или акту приёма-передачи. Ссылка на объект строкой: протокол
+    остаётся в реестре, даже если объект позже удалён."""
+    __tablename__ = "commission_decisions"
+    __table_args__ = (
+        UniqueConstraint("protocol_id", "object_type", "object_id",
+                         name="uq_commission_decisions_object"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    protocol_id: Mapped[str] = mapped_column(ForeignKey("commission_protocols.id"), index=True)
+    protocol: Mapped["CommissionProtocol"] = relationship(back_populates="decisions")
+    object_type: Mapped[str] = mapped_column(String(32), index=True)
+    object_id: Mapped[str] = mapped_column(String(64), index=True)
+    object_title: Mapped[str] = mapped_column(String(512), default="")
+    decision: Mapped[str] = mapped_column(String(16))
+    comment: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class NtoRecord(Base):
+    """Документ научно-технической обработки (ТС-176 п. 8.2): историческая
+    справка, предисловие к описи, акт о завершении работ по упорядочению, акт
+    о недостающих делах. Текстовые разделы — fields, перечень дел — items."""
+    __tablename__ = "nto_records"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    number: Mapped[str] = mapped_column(String(64), default="", index=True)
+    record_date: Mapped[date] = mapped_column(Date, default=date.today)
+    title: Mapped[str] = mapped_column(String(512), default="")
+    fond: Mapped[str] = mapped_column(String(128), default="")
+    year_from: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    year_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inventory_id: Mapped[str | None] = mapped_column(
+        ForeignKey("inventories.id"), nullable=True, index=True
+    )
+    fields: Mapped[dict] = mapped_column(JSON, default=dict)
+    items: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(32), default="Проект", index=True)
+    created_by: Mapped[str] = mapped_column(String(255), default="")
+    approved_by: Mapped[str] = mapped_column(String(255), default="")
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class TransferAct(Base):
+    """Акт приёма-передачи дел на государственное хранение (ТС-176 п. 5.3).
+    Электронные дела передаются информационным пакетом с контрольными
+    характеристиками; после передачи дела получают статус «Передано»."""
+    __tablename__ = "transfer_acts"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    number: Mapped[str] = mapped_column(String(64), index=True)
+    act_date: Mapped[date] = mapped_column(Date, default=date.today)
+    archive_name: Mapped[str] = mapped_column(String(512))
+    fond: Mapped[str] = mapped_column(String(128), default="")
+    basis: Mapped[str] = mapped_column(Text, default="")
+    note: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="Проект", index=True)
+    created_by: Mapped[str] = mapped_column(String(255), default="")
+    transferred_by: Mapped[str] = mapped_column(String(255), default="")
+    transferred_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    items: Mapped[list["TransferActItem"]] = relationship(
+        back_populates="act", cascade="all, delete-orphan",
+        order_by="TransferActItem.order_no",
+    )
+
+
+class TransferActItem(Base):
+    __tablename__ = "transfer_act_items"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    act_id: Mapped[str] = mapped_column(ForeignKey("transfer_acts.id"), index=True)
+    act: Mapped["TransferAct"] = relationship(back_populates="items")
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    case: Mapped["Case"] = relationship()
+    order_no: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class Attachment(Base):
+    """Электронный файл, приложенный к карточке описи, акта, запроса или
+    номенклатуры (п. 8). Хранится в том же объектном хранилище, что и документы."""
+    __tablename__ = "attachments"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    owner_type: Mapped[str] = mapped_column(String(32), index=True)
+    owner_id: Mapped[str] = mapped_column(String(64), index=True)
+    filename: Mapped[str] = mapped_column(String(512))
+    content_type: Mapped[str] = mapped_column(String(255), default="application/octet-stream")
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
+    storage_key: Mapped[str] = mapped_column(String(1024))
+    checksum_sha256: Mapped[str] = mapped_column(String(64), default="")
+    uploaded_by: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ChangeHistory(Base):
+    """История изменений записей (п. 8 «Администрирование», п. 9): что, кем и
+    когда изменено — по отдельным полям, со старым и новым значением."""
+    __tablename__ = "change_history"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    user_email: Mapped[str] = mapped_column(String(255), index=True)
+    object_type: Mapped[str] = mapped_column(String(32), index=True)
+    object_id: Mapped[str] = mapped_column(String(64), index=True)
+    field: Mapped[str] = mapped_column(String(64))
+    old_value: Mapped[str] = mapped_column(Text, default="")
+    new_value: Mapped[str] = mapped_column(Text, default="")
+
+
+class DocTypeAccess(Base):
+    """Доступ роли к категории документов (п. 8: «настройка параметров доступа к
+    документам в зависимости от категорий и типов документов»). Для роли без
+    записей ограничений нет; с записями — видны только перечисленные группы."""
+    __tablename__ = "doc_type_access"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    role: Mapped[str] = mapped_column(String(32), index=True)
+    doc_group: Mapped[str] = mapped_column(String(128))
+
+
+class SupportTicket(Base):
+    """Обращение в службу поддержки (п. 8), инцидент со сроками SLA (ТС-176
+    разд. 13), инцидент ИБ (разд. 14 п. 9) или заявка на дополнительную услугу
+    из Личного кабинета (разд. 14 п. 2.9, 2.10, 6.1). Виды, уровни и статусы —
+    в services/sla.py."""
+    __tablename__ = "support_tickets"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_email: Mapped[str] = mapped_column(String(255), index=True)
+    subject: Mapped[str] = mapped_column(String(512))
+    body: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="Новое", index=True)
+    answer: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    kind: Mapped[str] = mapped_column(String(32), default="question", index=True)
+    service: Mapped[str] = mapped_column(String(32), default="")
+    # Уровень критичности определяет заказчик (п. 13.1.1.1.3)
+    criticality: Mapped[str] = mapped_column(String(16), default="medium", index=True)
+    # Сроки фиксируются при регистрации обращения
+    reaction_due: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolution_due: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reacted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    assignee: Mapped[str] = mapped_column(String(255), default="")
+    reopen_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AvailabilitySample(Base):
+    """Поминутная отметка доступности системы для «процента доступности»
+    (ТС-176 п. 13.1.2.2). Минута без отметки считается недоступностью."""
+    __tablename__ = "availability_samples"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    minute: Mapped[datetime] = mapped_column(DateTime, unique=True, index=True)
+    ok: Mapped[bool] = mapped_column(default=True)
+
+
+class ApiKey(Base):
+    """Ключ доступа внешней информационной системы к API (п. 7, 9). Хранится
+    только хэш; сам ключ показывается один раз при создании."""
+    __tablename__ = "api_keys"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(255))
+    prefix: Mapped[str] = mapped_column(String(16), index=True)
+    key_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[Role] = mapped_column(Enum(Role), default=Role.viewer)
+    created_by: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ImportJob(Base):
+    """Задание массового импорта пакета документов (п. 8, модуль импорта)."""
+    __tablename__ = "import_jobs"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    filename: Mapped[str] = mapped_column(String(512))
+    status: Mapped[str] = mapped_column(String(32), default="В обработке", index=True)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    created_documents: Mapped[int] = mapped_column(Integer, default=0)
+    created_cases: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_duplicates: Mapped[int] = mapped_column(Integer, default=0)
+    errors: Mapped[str] = mapped_column(Text, default="[]")            # JSON
+    created_by: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

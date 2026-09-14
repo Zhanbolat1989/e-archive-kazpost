@@ -195,49 +195,97 @@ def cover_html(case: Case, docs: list[Document]) -> str:
 
 
 # ---------- Прил. 14/15: акт о выделении к уничтожению ----------
+_COPY_REASONS = {
+    "mismatch": "Салыстыру нәтижесі теріс / отрицательный результат сверки",
+    "no_original": "Түпнұсқасы жоқ / подлинник отсутствует",
+}
+
+
 def destruction_act_html(act, docs: list[Document]) -> str:
+    # Акт об уничтожении электронных копий (ТС-176 п. 11.7) — не по истечении
+    # срока хранения, а при отсутствии подлинника или отрицательной сверке.
+    copies = act.kind == "ecopy"
     kind = "ЭЛЕКТРОНДЫҚ ҚҰЖАТТАРДЫ" if act.is_electronic else "ҚҰЖАТТАРДЫ"
     kind_ru = "электронных документов" if act.is_electronic else "документов"
     appendix = "15" if act.is_electronic else "14"
     n = len(docs)
-    rows = "".join(
-        f"<tr><td class='center'>{i + 1}</td>"
-        f"<td>{_esc(d.doc_number or '—')}</td>"
-        f"<td class='center'>{_fmt_d(d.doc_date)}</td>"
-        f"<td>{_esc(d.title)}</td>"
-        f"<td class='center'>{_esc(d.retention_label or '—')}</td>"
-        f"<td class='center'>{_fmt_d(d.retention_until)}</td>"
-        + (f"<td class='small'>{_esc(d.checksum_sha256[:16])}…</td>"
-           if act.is_electronic else "")
-        + "</tr>"
-        for i, d in enumerate(docs)
-    )
-    extra_col = ("<th>Бақылау сипаттамасы<br/><span class='kz'>Контрольная "
-                 "характеристика</span></th>" if act.is_electronic else "")
+    if copies:
+        rows = "".join(
+            f"<tr><td class='center'>{i + 1}</td>"
+            f"<td>{_esc(d.doc_number or '—')}</td>"
+            f"<td class='center'>{_fmt_d(d.doc_date)}</td>"
+            f"<td>{_esc(d.title)}</td>"
+            f"<td>{_esc(_COPY_REASONS.get(d.copy_status, d.copy_status))}"
+            + (f"<br/><span class='small'>{_esc(d.copy_note)}</span>" if d.copy_note else "")
+            + "</td>"
+            f"<td class='small'>{_esc(d.checksum_sha256[:16])}…</td></tr>"
+            for i, d in enumerate(docs)
+        )
+        columns = (
+            "<th>Негізі<br/><span class='kz'>Основание</span></th>"
+            "<th>Бақылау сипаттамасы<br/><span class='kz'>Контрольная "
+            "характеристика</span></th>"
+        )
+        heading = (
+            f"<h1>ЭЛЕКТРОНДЫҚ КӨШІРМЕЛЕРДІ ЖОЮ ТУРАЛЫ АКТ № {_esc(act.number)}</h1>"
+            f"<h2>АКТ об уничтожении электронных копий документов № {_esc(act.number)} "
+            f"от {act.act_date.strftime('%d.%m.%Y')}</h2>"
+        )
+        intro = (
+            "<p>Қағаз түпнұсқасы болмаған немесе салыстыру нәтижесі теріс болған "
+            "жағдайда электрондық көшірмелер жойылады / При отсутствии бумажного "
+            "подлинника либо при отрицательном результате сверки уничтожаются "
+            "электронные копии документов:</p>"
+        )
+    else:
+        rows = "".join(
+            f"<tr><td class='center'>{i + 1}</td>"
+            f"<td>{_esc(d.doc_number or '—')}</td>"
+            f"<td class='center'>{_fmt_d(d.doc_date)}</td>"
+            f"<td>{_esc(d.title)}</td>"
+            f"<td class='center'>{_esc(d.retention_label or '—')}</td>"
+            f"<td class='center'>{_fmt_d(d.retention_until)}</td>"
+            + (f"<td class='small'>{_esc(d.checksum_sha256[:16])}…</td>"
+               if act.is_electronic else "")
+            + "</tr>"
+            for i, d in enumerate(docs)
+        )
+        columns = (
+            "<th>Сақтау мерзімі<br/><span class='kz'>Срок хранения</span></th>"
+            "<th>Мерзімі өткен күні<br/><span class='kz'>Срок истёк</span></th>"
+            + ("<th>Бақылау сипаттамасы<br/><span class='kz'>Контрольная "
+               "характеристика</span></th>" if act.is_electronic else "")
+        )
+        heading = (
+            f"<h1>{kind} ЖОЮҒА БӨЛУ ТУРАЛЫ АКТ № {_esc(act.number)}</h1>"
+            f"<h2>АКТ о выделении к уничтожению {kind_ru} № {_esc(act.number)} "
+            f"от {act.act_date.strftime('%d.%m.%Y')}</h2>"
+        )
+        intro = (
+            "<p>Сақтау мерзімі өткен, ғылыми-тарихи құндылығы жоқ құжаттар жоюға "
+            "бөлінді / На основании истечения сроков хранения отобраны к уничтожению "
+            "документы, не имеющие научно-исторической ценности:</p>"
+        )
     status_note = ("" if act.status.value == "Утверждён" else
                    "<p class='center' style='color:#a00'><b>ЖОБА / ПРОЕКТ</b></p>")
     body = (
         f"<div class='appendix'>Приложение {appendix} к Правилам приема, хранения, "
         "учета и использования документов НАФ (приказ МКС РК № 235 от 25.08.2023)</div>"
-        f"<h1>{kind} ЖОЮҒА БӨЛУ ТУРАЛЫ АКТ № {_esc(act.number)}</h1>"
-        f"<h2>АКТ о выделении к уничтожению {kind_ru} № {_esc(act.number)} "
-        f"от {act.act_date.strftime('%d.%m.%Y')}</h2>"
+        + heading
         + status_note +
         f"<div class='meta center'><b>{_esc(ORG_NAME)}</b></div>"
-        "<p>Сақтау мерзімі өткен, ғылыми-тарихи құндылығы жоқ құжаттар жоюға "
-        "бөлінді / На основании истечения сроков хранения отобраны к уничтожению "
-        "документы, не имеющие научно-исторической ценности:</p>"
+        + intro +
         "<table><thead><tr>"
         "<th>№</th>"
         "<th>Құжат нөмірі<br/><span class='kz'>Номер</span></th>"
         "<th>Күні<br/><span class='kz'>Дата</span></th>"
         "<th>Тақырыбы<br/><span class='kz'>Заголовок</span></th>"
-        "<th>Сақтау мерзімі<br/><span class='kz'>Срок хранения</span></th>"
-        "<th>Мерзімі өткен күні<br/><span class='kz'>Срок истёк</span></th>"
-        f"{extra_col}"
+        f"{columns}"
         f"</tr></thead><tbody>{rows}</tbody></table>"
         f"<p class='total'>Барлығы / Итого: <b>{n}</b> "
         f"({num_to_words_kz(n)} / {num_to_words_ru(n)}) құжат / документ(ов).</p>"
+        + (f"<p>ОСК (СК) келісілді / Согласовано с ЦЭК (ЭК): протокол "
+           f"{_esc(act.commission_protocol)}</p>" if act.commission_protocol else "")
         + (f"<p>Ескертпе / Примечание: {_esc(act.note)}</p>" if act.note else "") +
         f"<div class='sign'><span>Жасады / Составил: {_esc(act.created_by)}</span>"
         + (f"<span>Бекітті / Утвердил: {_esc(act.approved_by)}</span>"

@@ -28,7 +28,9 @@ def verify_signature(
         except Exception:  # noqa: BLE001
             content = None
 
-    result = signature.verify_cms(payload.cms_base64, content=content)
+    # Способ проверки — SIGNATURE_VERIFIER: в промышленном контуре через NCANode
+    # по Правилам № 1187 (ТС-176 разд. 14 п. 7).
+    result = signature.verify(payload.cms_base64, content=content)
 
     if payload.document_id:
         doc = db.get(Document, payload.document_id)

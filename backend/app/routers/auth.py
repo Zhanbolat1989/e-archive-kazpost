@@ -287,7 +287,8 @@ def revoke_my_session(request: Request, session_id: str,
 # ------------------------------------------------------------- Администрирование
 @router.get("/users", response_model=list[UserOut])
 def list_users(db: Session = Depends(get_db),
-               _: User = Depends(require_roles(Role.admin))):
+               # Аудитор ИБ видит учётные записи и их полномочия, но не меняет их.
+               _: User = Depends(require_roles(Role.admin, Role.auditor))):
     return [_out(db, u) for u in db.query(User).order_by(User.email).all()]
 
 
@@ -373,7 +374,8 @@ def unlock_user(request: Request, user_id: str, db: Session = Depends(get_db),
 
 @router.get("/sessions", response_model=list[SessionOut])
 def all_sessions(request: Request, db: Session = Depends(get_db),
-                 _: User = Depends(require_roles(Role.admin))):
+                 # Просмотр сессий — и аудитору ИБ; завершает их только администратор.
+                 _: User = Depends(require_roles(Role.admin, Role.auditor))):
     """Все активные сессии системы (п. 4.9 ТС)."""
     jti = getattr(request.state, "session_jti", None)
     now = datetime.utcnow()

@@ -15,8 +15,8 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import (
-    Case, Document, DocStatus, IssueRecord, IssueStatus, DestructionAct,
-    DestructionActItem, User,
+    ArchiveRequest, ArchiveRequestItem, AuditActionType, AuditLog, Case, Document,
+    DocStatus, IssueRecord, IssueStatus, DestructionAct, DestructionActItem, Role, User,
 )
 from ..security import get_current_user
 from ..services import audit
@@ -163,40 +163,218 @@ def _destruction_report(db: Session) -> dict:
     }
 
 
+def _views_report(db: Session) -> dict:
+    """Отчёт по просмотрам и обращениям к документам (ТЗ АГП п. 8).
+
+    Источник — аудиторский след: он и так фиксирует каждое открытие карточки,
+    и отдельный счётчик просмотров расходился бы с ним при любом сбое.
+    """
+    rows_q = (
+        db.query(AuditLog.object_id, func.count(AuditLog.id),
+                 func.max(AuditLog.ts), func.count(func.distinct(AuditLog.user_email)))
+        .filter(AuditLog.object_type == "document",
+                AuditLog.action_type == AuditActionType.read.value)
+        .group_by(AuditLog.object_id)
+        .order_by(func.count(AuditLog.id).desc())
+        .limit(500)
+        .all()
+    )
+    ids = [r[0] for r in rows_q]
+    docs = {d.id: d for d in (db.query(Document)
+                              .filter(Document.id.in_(ids)).all() if ids else [])}
+    rows = []
+    for doc_id, views, last_ts, readers in rows_q:
+        doc = docs.get(doc_id)
+        rows.append({
+            "document_id": doc_id,
+            "title": doc.title if doc else "(документ снят с учёта)",
+            "doc_type": doc.doc_type.value if doc and doc.doc_type else "",
+            "views": int(views),
+            "readers": int(readers),
+            "last_view": last_ts.isoformat() if last_ts else "",
+        })
+    # Обращения к документам через архивные запросы — второй канал
+    # использования: документ может ни разу не открываться в интерфейсе, но
+    # выдаваться по запросам.
+    request_uses = dict(
+        db.query(ArchiveRequestItem.document_id, func.count(ArchiveRequestItem.id))
+        .filter(ArchiveRequestItem.document_id.isnot(None))
+        .group_by(ArchiveRequestItem.document_id).all()
+    )
+    for r in rows:
+        r["archive_requests"] = int(request_uses.get(r["document_id"], 0))
+    return {
+        "title": "Отчет по просмотрам и обращениям к документам",
+        "generated_at": datetime.utcnow().isoformat(),
+        "total": len(rows),
+        "summary": {
+            "всего просмотров": sum(r["views"] for r in rows),
+            "документов просмотрено": len(rows),
+            "обращений по запросам": sum(request_uses.values()),
+        },
+        "rows": rows,
+    }
+
+
+def _archive_requests_report(db: Session) -> dict:
+    """Отчёт по архивным запросам: исполнение и соблюдение сроков (п. 8)."""
+    today = datetime.utcnow().date()
+    counts = dict(
+        db.query(ArchiveRequestItem.request_id, func.count(ArchiveRequestItem.id))
+        .group_by(ArchiveRequestItem.request_id).all()
+    )
+    rows = []
+    for r in (db.query(ArchiveRequest)
+              .order_by(ArchiveRequest.reg_date.desc()).all()):
+        closed = r.status in ("Исполнен", "Отказано")
+        overdue = bool(r.due_date and not closed and r.due_date < today)
+        late = bool(r.due_date and r.completed_at and r.completed_at > r.due_date)
+        rows.append({
+            "number": r.number,
+            "reg_date": r.reg_date.isoformat() if r.reg_date else "",
+            "applicant": r.applicant,
+            "request_type": r.request_type,
+            "subject": r.subject,
+            "status": r.status,
+            "executor": r.executor_email,
+            "due_date": r.due_date.isoformat() if r.due_date else "",
+            "completed_at": r.completed_at.isoformat() if r.completed_at else "",
+            "documents": int(counts.get(r.id, 0)),
+            "overdue": overdue,
+            "completed_late": late,
+        })
+    return {
+        "title": "Сводный отчет по архивным запросам",
+        "generated_at": datetime.utcnow().isoformat(),
+        "total": len(rows),
+        "summary": {
+            "в работе": sum(1 for r in rows
+                            if r["status"] not in ("Исполнен", "Отказано")),
+            "исполнено": sum(1 for r in rows if r["status"] == "Исполнен"),
+            "просрочено": sum(1 for r in rows if r["overdue"]),
+            "исполнено с нарушением срока": sum(1 for r in rows if r["completed_late"]),
+        },
+        "rows": rows,
+    }
+
+
+# Попытки несанкционированного доступа (события с отказом) и принятые меры —
+# по аудиторскому следу (ТС-176 разд. 14 п. 8).
+_PD_ATTEMPTS = {
+    "auth.login": "Неуспешный вход",
+    "auth.2fa": "Неверный код второго фактора",
+    "access.denied": "Обращение к закрытой категории документов",
+}
+_PD_MEASURES = {
+    "user.unlock": "Разблокирование учётной записи после проверки",
+    "session.revoke": "Принудительное завершение сессии",
+    "user.update": "Отключение учётной записи",
+}
+_QUARTERS = ("I", "II", "III", "IV")
+
+
+def _pd_category(r: AuditLog) -> tuple[str, str] | None:
+    """(вид события, категория) либо None, если событие к НСД не относится."""
+    if r.action in _PD_ATTEMPTS:
+        return ("попытка", _PD_ATTEMPTS[r.action]) if not r.result else None
+    if r.action == "user.update":
+        # Правка учётной записи — мера, только если запись отключена.
+        return ("мера", _PD_MEASURES[r.action]) if "is_active=False" in (r.detail or "") else None
+    if r.action in _PD_MEASURES and r.result:
+        return "мера", _PD_MEASURES[r.action]
+    return None
+
+
+def _quarter(ts: datetime) -> str:
+    return f"{_QUARTERS[(ts.month - 1) // 3]} кв. {ts.year}"
+
+
+def _pd_protection_report(db: Session) -> dict:
+    """Информация о попытках несанкционированного доступа к персональным данным
+    и принятых мерах — заказчику ежеквартально (ТС-176 разд. 14 п. 8).
+    Источник — аудиторский след за текущий год с разбивкой по кварталам."""
+    now = datetime.utcnow()
+    events = (db.query(AuditLog)
+              .filter(AuditLog.ts >= datetime(now.year, 1, 1),
+                      AuditLog.action.in_(sorted({*_PD_ATTEMPTS, *_PD_MEASURES})))
+              .order_by(AuditLog.ts.desc()).limit(20000).all())
+    rows = []
+    counts: dict[str, dict[str, int]] = {}
+    for r in events:
+        found = _pd_category(r)
+        if found is None:
+            continue
+        kind, category = found
+        quarter = _quarter(r.ts)
+        counts.setdefault(quarter, {"попытка": 0, "мера": 0})[kind] += 1
+        rows.append({
+            "ts": r.ts.isoformat(), "quarter": quarter, "kind": kind,
+            "category": category, "user": r.user_email, "ip": r.ip_address,
+            "detail": r.detail,
+        })
+    summary: dict[str, int] = {}
+    for q in range((now.month - 1) // 3 + 1):
+        label = f"{_QUARTERS[q]} кв. {now.year}"
+        summary[f"попыток НСД — {label}"] = counts.get(label, {}).get("попытка", 0)
+        summary[f"принятых мер — {label}"] = counts.get(label, {}).get("мера", 0)
+    return {
+        "title": "Попытки несанкционированного доступа к персональным данным и принятые меры",
+        "generated_at": now.isoformat(),
+        "total": len(rows),
+        "summary": summary,
+        "rows": rows,
+    }
+
+
 _REPORTS = {
     "cases": _cases_report,
     "documents": _documents_report,
     "issues": _issues_report,
     "destruction": _destruction_report,
+    "views": _views_report,
+    "archive_requests": _archive_requests_report,
+    "pd_protection": _pd_protection_report,
 }
+
+# Отчёты с данными журнала безопасности (логины, IP) — только администратору
+# и аудитору ИБ. Остальным такой отчёт «не существует».
+_RESTRICTED = {"pd_protection": (Role.admin, Role.auditor)}
+
+
+def _report_builder(key: str, user: User):
+    builder = _REPORTS.get(key)
+    roles = _RESTRICTED.get(key)
+    if builder is None or (roles and user.role not in roles):
+        raise HTTPException(status_code=404, detail="Отчёт не найден")
+    return builder
 
 
 @router.get("")
-def list_reports(_: User = Depends(get_current_user)) -> list[dict]:
-    return [
+def list_reports(user: User = Depends(get_current_user)) -> list[dict]:
+    reports = [
         {"key": "cases", "title": "Сводный отчет по делам"},
         {"key": "documents", "title": "Сводный отчет по документам"},
         {"key": "issues", "title": "Сводный отчет по запросам"},
         {"key": "destruction", "title": "Сводный отчет по актам на уничтожение"},
+        {"key": "views", "title": "Отчет по просмотрам и обращениям к документам"},
+        {"key": "archive_requests", "title": "Сводный отчет по архивным запросам"},
+        {"key": "pd_protection",
+         "title": "Попытки несанкционированного доступа к персональным данным (ежеквартально)"},
     ]
+    return [r for r in reports
+            if user.role in _RESTRICTED.get(r["key"], (user.role,))]
 
 
 @router.get("/{key}")
 def get_report(key: str, db: Session = Depends(get_db),
-               _: User = Depends(get_current_user)) -> dict:
-    builder = _REPORTS.get(key)
-    if builder is None:
-        raise HTTPException(status_code=404, detail="Отчёт не найден")
-    return builder(db)
+               user: User = Depends(get_current_user)) -> dict:
+    return _report_builder(key, user)(db)
 
 
 @router.get("/{key}/csv")
 def export_report_csv(key: str, request: Request, db: Session = Depends(get_db),
                       user: User = Depends(get_current_user)):
-    builder = _REPORTS.get(key)
-    if builder is None:
-        raise HTTPException(status_code=404, detail="Отчёт не найден")
-    data = builder(db)
+    data = _report_builder(key, user)(db)
     rows = data["rows"]
     buf = io.StringIO()
     if rows:

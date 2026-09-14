@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { api } from "./api.js";
+import { getPasskey } from "./webauthn.js";
 
 const AuthContext = createContext(null);
 
@@ -40,6 +41,15 @@ export function AuthProvider({ children }) {
     await finish(access_token);
   }
 
+  // Вход по ключу доступа — биометрия или PIN устройства (ТС-176 разд. 14 п. 4.2).
+  // Email не нужен: устройство само предлагает сохранённый для сайта ключ.
+  async function loginWithPasskey() {
+    const { challenge_id, options } = await api.passkeyLoginOptions();
+    const credential = await getPasskey(options);
+    const { access_token } = await api.passkeyLogin(challenge_id, credential);
+    await finish(access_token);
+  }
+
   async function logout() {
     // Сессию гасим на сервере, иначе токен остался бы действующим до истечения.
     try {
@@ -55,7 +65,7 @@ export function AuthProvider({ children }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, login, verifyTwoFactor, logout, refresh }}
+      value={{ user, loading, login, verifyTwoFactor, loginWithPasskey, logout, refresh }}
     >
       {children}
     </AuthContext.Provider>

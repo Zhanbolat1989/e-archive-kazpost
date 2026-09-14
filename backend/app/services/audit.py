@@ -13,6 +13,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..models import AuditLog, AuditActionType, User
 
 log = logging.getLogger("audit")
@@ -23,12 +24,20 @@ MAX_UA = 500
 
 
 def client_meta(request) -> tuple[str, str]:
-    """IP и user-agent из запроса. За обратным прокси реальный адрес приходит
-    в X-Forwarded-For, поэтому он имеет приоритет над адресом сокета."""
+    """IP и user-agent из запроса.
+
+    X-Forwarded-For берётся только при TRUST_PROXY_HEADERS: это обычный
+    заголовок запроса, и клиент волен прислать любой. Без прокси перед backend
+    (как в поставляемом docker compose) доверие к нему означало бы, что адрес
+    в аудиторском следе — включая записи о неудачных входах — подделывается
+    одной строкой в curl, то есть обязательное поле ТС-176 ничего не доказывает.
+    """
     if request is None:
         return "", ""
-    fwd = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-    ip = fwd or (request.client.host if request.client else "")
+    ip = ""
+    if settings.TRUST_PROXY_HEADERS:
+        ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    ip = ip or (request.client.host if request.client else "")
     return ip[:64], (request.headers.get("user-agent") or "")[:MAX_UA]
 
 

@@ -44,6 +44,10 @@ export default function Search() {
   const [busy, setBusy] = useState(false);
   const [selected, setSelected] = useState(null);
   const endRef = useRef();
+  // Управление текущим запросом: контроллер обрывает ожидание в браузере,
+  // идентификатор — останавливает генерацию на сервере.
+  const abortRef = useRef(null);
+  const requestIdRef = useRef(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -63,6 +67,14 @@ export default function Search() {
     } catch (_) {}
   }
 
+  function stop() {
+    // Сначала сообщаем серверу — он прервёт генерацию и освободит модель;
+    // затем обрываем ожидание в браузере.
+    const id = requestIdRef.current;
+    if (id) api.cancelAgent(id).catch(() => {});
+    abortRef.current?.abort();
+  }
+
   async function ask(q) {
     const question = (q ?? input).trim();
     if (!question || busy) return;
@@ -70,12 +82,19 @@ export default function Search() {
     const next = [...messages, { role: "user", content: question }];
     setMessages(next);
     setBusy(true);
+
+    const requestId =
+      crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const controller = new AbortController();
+    requestIdRef.current = requestId;
+    abortRef.current = controller;
+
     try {
       // Send only clean role/content turns (no tool internals) as history.
       const history = next
         .filter((m) => m.role === "user" || m.role === "assistant")
         .map((m) => ({ role: m.role, content: m.content }));
-      const res = await api.agent(history);
+      const res = await api.agent(history, { requestId, signal: controller.signal });
       setMessages((m) => [
         ...m,
         {
@@ -83,14 +102,24 @@ export default function Search() {
           content: res.answer,
           sources: res.sources || [],
           steps: res.steps || [],
+          confidence: res.confidence || null,
         },
       ]);
     } catch (err) {
+      // Остановка по кнопке — не ошибка, а осознанное действие пользователя.
+      const stopped = err.name === "AbortError";
       setMessages((m) => [
         ...m,
-        { role: "assistant", content: `Ошибка: ${err.message}`, sources: [], steps: [] },
+        {
+          role: "assistant",
+          content: stopped ? "⏹ Генерация остановлена." : `Ошибка: ${err.message}`,
+          sources: [],
+          steps: [],
+        },
       ]);
     } finally {
+      abortRef.current = null;
+      requestIdRef.current = null;
       setBusy(false);
     }
   }
@@ -134,14 +163,30 @@ export default function Search() {
                 </details>
               )}
               <div className="msg-text">{m.content}</div>
+              {m.confidence && m.confidence !== "high" && (
+                <div className={`confidence ${m.confidence}`}>
+                  {m.confidence === "low"
+                    ? "Низкая уверенность: числа в ответе расходятся с текстом документов"
+                    : "Средняя уверенность: сверьте ключевые данные по источникам"}
+                </div>
+              )}
               {m.sources && m.sources.length > 0 && (
                 <div className="msg-sources">
                   <div className="msg-sources-label">Источники:</div>
+                  {/* Ссылка на документ, страницу и фрагмент (ТЗ АГП п. 12.3):
+                      цитата рядом с источником позволяет проверить ответ,
+                      не открывая документ целиком. */}
                   {m.sources.map((s, j) => (
-                    <button key={s.id} className="source-chip" onClick={() => openSource(s.id)}>
-                      <span className="source-num">[{j + 1}]</span> {s.title}
-                      {s.fond && <span className="source-fond"> · {s.fond}</span>}
-                    </button>
+                    <div key={s.id} className="source-item">
+                      <button className="source-chip" onClick={() => openSource(s.id)}>
+                        <span className="source-num">[{j + 1}]</span> {s.title}
+                        {s.page_no && <span className="source-fond"> · с. {s.page_no}</span>}
+                        {s.fond && <span className="source-fond"> · {s.fond}</span>}
+                      </button>
+                      {s.fragment && (
+                        <div className="source-fragment muted">«{s.fragment}»</div>
+                      )}
+                    </div>
                   ))}
                 </div>
               )}
@@ -154,6 +199,9 @@ export default function Search() {
             <div className="msg-avatar">ИИ</div>
             <div className="msg-body">
               <div className="typing"><span></span><span></span><span></span></div>
+              <button className="btn small stop-btn" onClick={stop}>
+                ⏹ Остановить
+              </button>
             </div>
           </div>
         )}
@@ -182,9 +230,15 @@ export default function Search() {
           placeholder="Спросите что-нибудь об архиве…"
           disabled={busy}
         />
-        <button className="btn primary" disabled={busy || !input.trim()}>
-          {busy ? "…" : "Отправить"}
-        </button>
+        {busy ? (
+          <button type="button" className="btn danger" onClick={stop}>
+            ⏹ Стоп
+          </button>
+        ) : (
+          <button className="btn primary" disabled={!input.trim()}>
+            Отправить
+          </button>
+        )}
       </form>
 
       {selected && (

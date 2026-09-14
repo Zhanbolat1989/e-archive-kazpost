@@ -2,7 +2,12 @@
 
 Удаления записей нет и не может быть: по требованию ТЗ администратору доступен
 только перенос журнала в архив. Соответствующего эндпоинта DELETE здесь
-намеренно не существует.
+намеренно не существует, а в СУБД удаление и правку записей блокирует триггер
+(см. migrate.py).
+
+Просмотр и выгрузка доступны также аудитору ИБ (разд. 14 п. 5.1): он работает
+с журналами, не имея доступа к содержимому документов. Перенос в архив —
+только администратору.
 """
 import io
 import json
@@ -20,6 +25,8 @@ from ..security import require_roles
 from ..services import audit as audit_svc
 
 router = APIRouter(prefix="/api/audit", tags=["audit"])
+
+READERS = (Role.admin, Role.auditor)
 
 
 def _filtered(db: Session, user_email: str | None, action_type: str | None,
@@ -45,10 +52,10 @@ def list_audit(
     result: bool | None = None,
     archived: bool | None = None,
     days: int | None = None,
-    limit: int = Query(200, le=2000),
-    offset: int = 0,
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles(Role.admin)),
+    _: User = Depends(require_roles(*READERS)),
 ):
     return _filtered(db, user_email, action_type, result, archived, days) \
         .offset(offset).limit(limit).all()
@@ -56,7 +63,7 @@ def list_audit(
 
 @router.get("/stats")
 def audit_stats(db: Session = Depends(get_db),
-                _: User = Depends(require_roles(Role.admin))) -> dict:
+                _: User = Depends(require_roles(*READERS))) -> dict:
     total = db.query(AuditLog).count()
     archived = db.query(AuditLog).filter(AuditLog.archived.is_(True)).count()
     failures = db.query(AuditLog).filter(AuditLog.result.is_(False)).count()
@@ -84,7 +91,7 @@ def export_audit(
     result: bool | None = None,
     days: int | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(require_roles(Role.admin)),
+    user: User = Depends(require_roles(*READERS)),
     request: Request = None,
 ):
     """Выгрузка журнала (п. 6.1 разд. 14: предоставление информации о

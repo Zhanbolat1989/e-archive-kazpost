@@ -12,6 +12,7 @@ from ..models import (
 from ..retention import compute_until
 from ..schemas import CaseCreate, CaseUpdate, CaseOut, CaseDetail
 from ..security import get_current_user, require_roles
+from ..services import access, audit, llm
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
 
@@ -71,13 +72,15 @@ def create_case(
 
 @router.get("/{case_id}", response_model=CaseDetail)
 def get_case(
-    case_id: str, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+    case_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
     case = db.get(Case, case_id)
     if not case:
         raise HTTPException(status_code=404, detail="Дело не найдено")
+    # Документы закрытых для роли категорий в деле не показываем: иначе их
+    # идентификаторы и реквизиты раскрывались бы через карточку дела.
     docs = (
-        db.query(Document)
+        access.apply(db.query(Document), db, user)
         .filter(Document.case_id == case_id)
         .order_by(Document.doc_date.asc().nullslast(), Document.created_at)
         .all()
@@ -86,6 +89,58 @@ def get_case(
     out.documents_count = len(docs)
     out.documents = docs
     return out
+
+
+@router.post("/{case_id}/annotate")
+def annotate_case(
+    case_id: str, db: Session = Depends(get_db),
+    user: User = Depends(require_roles(Role.admin, Role.archivist)),
+) -> dict:
+    """Аннотация дела, составленная моделью (ТЗ АГП п. 12.4: «формирование
+    аннотации документа или дела»).
+
+    Модель читает не тексты документов, а их аннотации и реквизиты: дело — это
+    сотни листов, они не помещаются в контекст, да и обобщать по готовым
+    аннотациям точнее, чем по обрывкам распознанного текста.
+    """
+    case = db.get(Case, case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="Дело не найдено")
+    docs = (db.query(Document)
+            .filter(Document.case_id == case_id, Document.destroyed_at.is_(None))
+            .order_by(Document.doc_date.asc().nullslast(), Document.created_at)
+            .all())
+    if not docs:
+        raise HTTPException(status_code=400, detail="В деле нет документов")
+
+    lines = []
+    for d in docs:
+        head = f"{d.doc_type.value if d.doc_type else 'Документ'}"
+        if d.doc_number:
+            head += f" № {d.doc_number}"
+        if d.doc_date:
+            head += f" от {d.doc_date.strftime('%d.%m.%Y')}"
+        if d.counterparty:
+            head += f", {d.counterparty}"
+        body = (d.annotation or d.description or "").strip()
+        lines.append(f"{head}. {body}".strip())
+    text = "\n".join(lines)[:8000]
+
+    if not llm.is_ready():
+        raise HTTPException(status_code=503,
+                            detail="Модель ИИ ещё загружается — повторите позже")
+    try:
+        annotation = llm.annotate(
+            f"{case.index} · {case.title}".strip(" ·"), text, "Дело"
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502,
+                            detail=f"Модель не ответила: {exc}") from exc
+    case.annotation = annotation
+    db.commit()
+    audit.record(db, user, "case.annotate", "case", case.id,
+                 f"документов в основе: {len(docs)}")
+    return {"id": case.id, "annotation": annotation, "documents": len(docs)}
 
 
 @router.patch("/{case_id}", response_model=CaseOut)

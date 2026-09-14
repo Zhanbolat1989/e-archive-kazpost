@@ -1,0 +1,96 @@
+# ════════════════════════════════════════════════════════════════════════
+#  Промышленный контур ИС «Электронный архив» АО «Казпочта» (ТС-176).
+#
+#    cp .env.kazpost.example .env          # заполнить секреты и SMTP
+#    mkdir certs                           # fullchain.pem + privkey.pem
+#    docker compose -f docker-compose.yml -f docker-compose.kazpost.yml up -d --build
+#
+#  Отличия от базового стенда:
+#  - наружу опубликован только веб-вход (80 → 443); база, хранилище, поиск,
+#    модель и API доступны лишь во внутренней сети контейнеров;
+#  - HTTPS с перезаписью X-Forwarded-For — поэтому backend доверяет заголовку;
+#  - редакция «Казпочта»: оформление и меню по модулям ТС-176.
+# ════════════════════════════════════════════════════════════════════════
+name: earchive-kazpost
+
+services:
+  postgres:
+    ports: !reset []
+  minio:
+    ports: !reset []
+  opensearch:
+    ports: !reset []
+  ollama:
+    ports: !reset []
+  ocr:
+    ports: !reset []
+
+  backend:
+    ports: !reset []
+    environment:
+      EDITION: kazpost
+      # Пара к nginx.tls.conf: прокси перезаписывает X-Forwarded-For, поэтому
+      # адрес клиента в аудиторском следе берётся из заголовка.
+      TRUST_PROXY_HEADERS: "true"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_EDITION: kazpost
+    ports: !override
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./frontend/nginx.tls.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${TLS_CERT_DIR:-./certs}:/etc/nginx/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null || exit 1"]
+
+  # ── Резервное копирование (ТС-176 разд. 14 п. 1.1) ─────────────────────
+  # Копии пишутся в BACKUP_DIR — лучше на отдельный диск. Восстановление —
+  # в README, раздел «Резервное копирование и восстановление».
+  backup-db:
+    image: postgres:16-alpine
+    mem_limit: 256m
+    env_file: .env
+    entrypoint: ["/bin/sh", "/scripts/backup-db.sh"]
+    volumes:
+      - ./deploy/backup/backup-db.sh:/scripts/backup-db.sh:ro
+      - ${BACKUP_DIR:-./backups}:/backups
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      # Нездоров, если последней удачной копии больше двух интервалов.
+      test: ["CMD-SHELL", "test -f /backups/db/last_success && [ $$(( $$(date -u +%s) - $$(cat /backups/db/last_success) )) -lt $$(( $${BACKUP_INTERVAL_HOURS:-24} * 7200 )) ]"]
+      interval: 1h
+      timeout: 10s
+      retries: 1
+      start_period: 30m
+    restart: unless-stopped
+
+  # Хранилище документов зеркалируется непрерывно: оригиналы под WORM
+  # неизменны, поэтому зеркало только дополняется. Пароль в MC_HOST_archive
+  # должен быть URL-кодирован, если содержит спецсимволы.
+  backup-objects:
+    image: minio/mc:latest
+    mem_limit: 256m
+    environment:
+      MC_HOST_archive: "http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000"
+    command: ["mirror", "--watch", "--overwrite", "archive/${MINIO_BUCKET:-archive}", "/backups/objects"]
+    volumes:
+      - ${BACKUP_DIR:-./backups}:/backups
+    depends_on:
+      minio: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ── Проверка ЭЦП по Правилам № 1187 (ТС-176 разд. 14 п. 7) ─────────────
+  # NCANode: ГОСТ 34.10-2015, цепочка до корневых сертификатов НУЦ РК, отзыв
+  # по OCSP. Контейнеру нужен исходящий доступ к OCSP НУЦ РК из контура
+  # заказчика. При развёртывании закрепите версию образа 3.x и сверьте формат
+  # ответа тестом tests/test_ncanode.py. Backend обращается к нему по
+  # NCANODE_URL при SIGNATURE_VERIFIER=ncanode.
+  ncanode:
+    image: malikzh/ncanode:latest
+    mem_limit: 512m
+    restart: unless-stopped
