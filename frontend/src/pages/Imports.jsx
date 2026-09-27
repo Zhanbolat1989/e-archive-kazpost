@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { api } from "../api.js";
 
-// Модуль импорта (ТЗ АГП п. 8) и восстановление из резервной копии (п. 9).
+// Модуль импорта и восстановление из резервной копии.
 const STATUS_CLASS = {
   "В обработке": "b-amber",
   "Загружен": "b-green",

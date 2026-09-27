@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ТЗ «Азиатский Газопровод»: постраничный OCR, реквизиты, качество, дубли,
+"""Оцифровка: постраничный OCR, реквизиты, качество, дубли,
 расширенный поиск."""
 import pytest
 
@@ -56,9 +56,9 @@ def test_tsv_without_words_has_no_confidence():
 
 # ------------------------------------------------------------ реквизиты
 DOC = (
-    "ДОГОВОР ПОСТАВКИ № АГП-2019/14\n"
+    "ДОГОВОР ПОСТАВКИ № СЭ-2019/14\n"
     "г. Алматы, 11 марта 2019 г.\n"
-    "ТОО «Азиатский Газопровод», БИН 070540011223, и ТОО «Кагаз Логистик».\n"
+    "ТОО «Степь Энерго», БИН 070540011223, и ТОО «Кагаз Логистик».\n"
     "Сумма договора 12 800 000 тенге." + PB +
     "Оплата по счёту № СФ-2019/7 от 15.03.2019. Подписал Мукушев Д.Б.\n"
     "Ответственный: Иванов Сергей Петрович, пр. Абая 109В."
@@ -93,7 +93,7 @@ def test_reference_number_is_not_duplicated_as_own_number():
     """«по счёту № СФ-2019/7» — ссылка на другой документ, а не номер этого."""
     found = entities.extract(DOC)
     own_numbers = {e.normalized for e in _by_kind(found, "reg_number")}
-    assert "АГП-2019/14" in own_numbers
+    assert "СЭ-2019/14" in own_numbers
     assert "СФ-2019/7" not in own_numbers
 
 
@@ -119,9 +119,9 @@ def test_invalid_date_is_rejected():
 
 def test_suggestions_skip_own_organization():
     sugg = entities.suggest_requisites(entities.extract(DOC),
-                                       own_org="Азиатский Газопровод")
+                                       own_org="Степь Энерго")
     assert sugg["doc_date"] == "2019-03-11"
-    assert sugg["doc_number"] == "АГП-2019/14"
+    assert sugg["doc_number"] == "СЭ-2019/14"
     assert sugg["counterparty"] == "ТОО «Кагаз Логистик»"
     assert sugg["amount"] == 12800000.0 and sugg["currency"] == "KZT"
 

@@ -115,7 +115,7 @@ def get_current_user(
     return user
 
 
-# ---- Ключи доступа внешних информационных систем (ТЗ АГП п. 7, 9) ----
+# ---- Ключи доступа внешних информационных систем ----
 API_KEY_HEADER = "X-API-Key"
 API_KEY_PREFIX_LEN = 8
 

@@ -3,7 +3,7 @@ import { api } from "../api.js";
 import { useAuth } from "../auth.jsx";
 import { useSort, SortTh, dateKey } from "../sort.jsx";
 
-// Реестр архивных запросов (ТЗ АГП п. 8): обращение → исполнитель → ответ.
+// Реестр архивных запросов: обращение → исполнитель → ответ.
 const SORT = {
   number: (r) => r.number,
   reg_date: (r) => dateKey(r.reg_date),

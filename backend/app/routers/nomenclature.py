@@ -105,7 +105,7 @@ def set_status(
     user: User = Depends(require_roles(Role.admin, Role.archivist)),
 ):
     """Перевод статьи по жизненному циклу: проект → на согласовании →
-    действующая → архивная (ТЗ АГП п. 8)."""
+    действующая → архивная."""
     item = db.get(NomenclatureItem, item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Статья номенклатуры не найдена")
@@ -162,7 +162,7 @@ def delete_item(
 def summary_xlsx(request: Request, year: int | None = None,
                  db: Session = Depends(get_db),
                  user: User = Depends(get_current_user)):
-    """Сводная номенклатура дел организации в Excel (ТЗ АГП п. 8).
+    """Сводная номенклатура дел организации в Excel.
 
     Сводная — значит по всем подразделениям сразу, с числом заведённых дел по
     каждой статье: именно так её сдают на согласование.

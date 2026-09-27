@@ -242,7 +242,7 @@ export default function Cases() {
               )}
               {canEdit && selected.documents.length > 0 && (
                 <button className="btn"
-                  title="Краткое содержание дела по аннотациям его документов (ТЗ АГП п. 12.4)"
+                  title="Краткое содержание дела по аннотациям его документов"
                   onClick={async () => {
                     setError("");
                     try {

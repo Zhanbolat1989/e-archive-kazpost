@@ -158,7 +158,7 @@ export default function Upload() {
           </div>
         )}
 
-        {/* Подразделение — атрибут индексирования по ТЗ АГП п. 3 */}
+        {/* Подразделение — атрибут индексирования */}
         <label>Подразделение</label>
         <select value={meta.department_id}
                 onChange={(e) => setMeta({ ...meta, department_id: e.target.value })}>

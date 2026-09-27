@@ -208,7 +208,7 @@ def act_pdf(act_id: str, db: Session = Depends(get_db),
     )
 
 
-# ---------- Сроки уничтожения: перечни по годам (ТЗ АГП п. 8) ----------
+# ---------- Сроки уничтожения: перечни по годам ----------
 @router.get("/destruction-overview")
 def destruction_overview(db: Session = Depends(get_db),
                          user: User = Depends(get_current_user)) -> dict:

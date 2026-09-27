@@ -31,7 +31,7 @@ _COLUMNS: list[tuple[str, str, str]] = [
     # Оптимистичная блокировка карточек (п. 6.4 ТС)
     ("documents", "version", "INTEGER NOT NULL DEFAULT 1"),
     ("cases", "version", "INTEGER NOT NULL DEFAULT 1"),
-    # ТЗ «Азиатский Газопровод»: атрибуты индексирования, качество OCR, дубли
+    # Атрибуты индексирования, качество OCR, дубли
     ("documents", "department_id", "UUID REFERENCES departments(id)"),
     ("documents", "page_count", "INTEGER"),
     ("documents", "ocr_confidence", "NUMERIC(5,2)"),

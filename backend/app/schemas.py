@@ -303,7 +303,7 @@ class DocumentOut(BaseModel):
     replaces_id: Optional[str] = None
     superseded_at: Optional[date] = None
     version: int = 1
-    # Атрибуты индексирования и контроль качества (ТЗ АГП п. 3, п. 12.5)
+    # Атрибуты индексирования и контроль качества
     department_id: Optional[str] = None
     page_count: Optional[int] = None
     # Непустой ключ означает, что для документа есть PDF/A с текстовым слоем
@@ -458,7 +458,7 @@ class CaseOut(BaseModel):
     retention_until: Optional[date]
     note: str
     documents_count: int = 0
-    # Аннотация дела, составленная ИИ (ТЗ АГП п. 12.4)
+    # Аннотация дела, составленная ИИ
     annotation: str = ""
     department_id: Optional[str] = None
 
@@ -633,7 +633,7 @@ class ChatSource(BaseModel):
     opis: str = ""
     delo: str = ""
     score: float = 0.0
-    # Страница и цитата, на которых основан ответ (ТЗ АГП п. 12.3: ссылка на
+    # Страница и цитата, на которых основан ответ (ссылка на
     # документ, страницу и фрагмент). None — источник выбран по метаданным
     # (перечень, подсчёт), и конкретной страницы у него нет.
     page_no: Optional[int] = None
@@ -694,7 +694,7 @@ class SignatureVerifyResponse(BaseModel):
 
 
 # =============================================================================
-# ТЗ «Азиатский Газопровод»: модули п. 8
+# Архивные реестры, импорт и администрирование
 # =============================================================================
 
 # ---- Архивные запросы ----

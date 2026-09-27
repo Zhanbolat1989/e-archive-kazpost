@@ -4,7 +4,7 @@ COPY package.json ./
 RUN npm install
 COPY . .
 # Редакция влияет на манифест PWA — название установленного приложения.
-ARG VITE_EDITION=base
+ARG VITE_EDITION=kazpost
 ENV VITE_EDITION=$VITE_EDITION
 RUN npm run build
 

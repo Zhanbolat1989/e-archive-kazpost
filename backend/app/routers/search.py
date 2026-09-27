@@ -28,7 +28,7 @@ def search_documents(
     user: User = Depends(get_api_or_user),
 ):
     """Поиск по смыслу, словоформам и реквизитам. Поддерживает логические
-    операторы И / ИЛИ / НЕ и фразу в кавычках (ТЗ АГП п. 8, 12.2)."""
+    операторы И / ИЛИ / НЕ и фразу в кавычках."""
     hits = search_svc.search(q, mode=mode, size=size,
                              allowed_types=access.allowed_type_values(db, user))
     return SearchResponse(
@@ -99,7 +99,7 @@ def chat(
 
 def _journal(db: Session, user: User, question: str, result: dict,
              route: str, started: float, cancelled: bool = False) -> None:
-    """Журнал запросов и ответов ИИ-агента (ТЗ АГП п. 12.6).
+    """Журнал запросов и ответов ИИ-агента.
 
     Пишется для каждого ответа, включая отказы и остановленную генерацию:
     ценность журнала как раз в том, чтобы видеть, когда ассистент отвечать

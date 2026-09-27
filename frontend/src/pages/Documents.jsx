@@ -15,7 +15,7 @@ const DOC_SORT = {
   status: (d) => (d.destroyed_at ? "уничтожен" : d.status),
 };
 
-// Фильтры модуля «Документы» по ТЗ АГП п. 8.
+// Фильтры модуля «Документы».
 const RETENTION = [
   { value: "", label: "любой срок" },
   { value: "permanent", label: "постоянного хранения" },

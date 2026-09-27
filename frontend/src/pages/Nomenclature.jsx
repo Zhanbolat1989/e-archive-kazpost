@@ -13,7 +13,7 @@ const NOM_SORT = {
   status: (n) => n.status,
 };
 
-// Жизненный цикл статьи номенклатуры (ТЗ АГП п. 8).
+// Жизненный цикл статьи номенклатуры.
 const STATUS_CLASS = {
   "Проект": "b-gray",
   "На согласовании": "b-amber",
@@ -121,7 +121,7 @@ export default function Nomenclature() {
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <button className="btn"
-                  title="Сводная номенклатура дел организации в Excel (ТЗ АГП п. 8)"
+                  title="Сводная номенклатура дел организации в Excel"
                   onClick={() => api.downloadBlob("/nomenclature/summary/xlsx", "nomenclature.xlsx")
                     .catch((e) => setError(e.message))}>
             Сводная в Excel

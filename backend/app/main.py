@@ -54,7 +54,7 @@ app.include_router(enterprise.router)
 app.include_router(reports.router)
 app.include_router(approvals.router)
 app.include_router(exports.router)
-# Модули по ТЗ «Азиатский Газопровод»: архивные запросы, описи дел, вложения,
+# Архивные реестры: архивные запросы, описи дел, вложения,
 # импорт пакетов оцифровки, обращения в поддержку, администрирование
 app.include_router(requests_router.router)
 app.include_router(inventories.router)

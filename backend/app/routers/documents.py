@@ -322,7 +322,7 @@ def list_documents(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Перечень документов с фильтрами модуля «Документы» (ТЗ АГП п. 8):
+    """Перечень документов с фильтрами модуля «Документы»:
     подразделение, вид документа, срок хранения и срок уничтожения.
 
     retention: permanent — постоянного хранения; expired — срок истёк, документ
@@ -376,8 +376,8 @@ def review_queue(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles(Role.admin, Role.archivist)),
 ) -> dict:
-    """Перечень документов, требующих ручной проверки после распознавания
-    (ТЗ АГП п. 12.5): низкая уверенность OCR, пустые страницы, дубли.
+    """Перечень документов, требующих ручной проверки после распознавания:
+    низкая уверенность OCR, пустые страницы, дубли.
 
     Отдаём вместе со сводкой качества: архивариусу нужно понимать не только
     что проверять, но и насколько в целом удалась партия оцифровки."""
@@ -443,8 +443,7 @@ def document_entities(
     doc_id: str, db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[dict]:
-    """Реквизиты, извлечённые из текста, с привязкой к странице и фрагменту
-    (ТЗ АГП п. 12.1)."""
+    """Реквизиты, извлечённые из текста, с привязкой к странице и фрагменту."""
     doc = db.get(Document, doc_id)
     if not doc or not access.can_see(db, user, doc):
         raise HTTPException(status_code=404, detail="Документ не найден")
@@ -619,7 +618,7 @@ def download_pdfa(
     doc_id: str, db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """PDF/A с текстовым слоем — результат оцифровки по ТЗ АГП п. 3."""
+    """PDF/A с текстовым слоем — результат оцифровки."""
     doc = db.get(Document, doc_id)
     if not doc or not access.can_see(db, user, doc):
         raise HTTPException(status_code=404, detail="Документ не найден")

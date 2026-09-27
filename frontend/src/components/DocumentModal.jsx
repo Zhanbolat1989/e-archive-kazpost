@@ -13,7 +13,7 @@ function b64(bytes) {
 
 const fmtD = (d) => (d ? new Date(d).toLocaleDateString("ru-RU") : "—");
 
-// Виды реквизитов, извлекаемых из текста (ТЗ АГП п. 12.1).
+// Виды реквизитов, извлекаемых из текста.
 const ENTITY_LABELS = {
   date: "дата",
   reg_number: "номер",
@@ -301,7 +301,7 @@ export default function DocumentModal({ doc, onClose, onChanged, canDelete, onOp
             </summary>
             {/* Страницы разделяются символом подачи страницы — показываем их
                 по отдельности, чтобы номер страницы совпадал со ссылками
-                ассистента (ТЗ АГП п. 12.3). */}
+                ассистента. */}
             {doc.ocr_text.split("\f").slice(0, 20).map((page, i) => (
               <div key={i}>
                 {doc.page_count > 1 && (
@@ -463,7 +463,7 @@ export default function DocumentModal({ doc, onClose, onChanged, canDelete, onOp
           </button>
           {doc.pdfa_key && (
             <button className="btn"
-              title="PDF/A с текстовым слоем — результат оцифровки (ТЗ АГП п. 3)"
+              title="PDF/A с текстовым слоем — результат оцифровки"
               onClick={() => api.downloadBlob(`/documents/${doc.id}/pdfa`, `${doc.id}.pdfa.pdf`)
                 .catch((e) => setSigError(e.message))}>
               📑 PDF/A с текстом

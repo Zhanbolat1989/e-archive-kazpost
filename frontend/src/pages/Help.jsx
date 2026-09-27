@@ -79,7 +79,7 @@ const SECTIONS = [
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 
-// Обращение в службу поддержки (ТЗ АГП п. 8, модуль «Помощь»).
+// Обращение в службу поддержки (модуль «Помощь»).
 function SupportForm() {
   const [form, setForm] = useState({ subject: "", body: "" });
   const [tickets, setTickets] = useState([]);

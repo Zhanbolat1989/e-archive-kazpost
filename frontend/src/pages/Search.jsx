@@ -173,7 +173,7 @@ export default function Search() {
               {m.sources && m.sources.length > 0 && (
                 <div className="msg-sources">
                   <div className="msg-sources-label">Источники:</div>
-                  {/* Ссылка на документ, страницу и фрагмент (ТЗ АГП п. 12.3):
+                  {/* Ссылка на документ, страницу и фрагмент:
                       цитата рядом с источником позволяет проверить ответ,
                       не открывая документ целиком. */}
                   {m.sources.map((s, j) => (

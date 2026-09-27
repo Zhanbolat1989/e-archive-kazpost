@@ -19,7 +19,7 @@ const APPS = {
     theme_color: "#1f5aa8",
   },
 };
-const app = APPS[process.env.VITE_EDITION] || APPS.base;
+const app = APPS[process.env.VITE_EDITION] || APPS.kazpost;
 
 export default defineConfig({
   plugins: [

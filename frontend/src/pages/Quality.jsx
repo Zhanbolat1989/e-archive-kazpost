@@ -4,7 +4,7 @@ import DocumentModal from "../components/DocumentModal.jsx";
 import { useAuth } from "../auth.jsx";
 import { useSort, SortTh, dateKey } from "../sort.jsx";
 
-// Контроль качества оцифровки (ТЗ АГП п. 12.5): перечень документов, требующих
+// Контроль качества оцифровки: перечень документов, требующих
 // ручной проверки, со сводкой по распознаванию.
 const SORT = {
   title: (d) => d.title,

@@ -132,7 +132,7 @@ class NomenclatureItem(Base):
     permanent: Mapped[bool] = mapped_column(default=False)
     note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    # --- Жизненный цикл номенклатуры (ТЗ АГП п. 8): проект → на согласовании →
+    # --- Жизненный цикл номенклатуры: проект → на согласовании →
     # действующая. Строка, а не Enum: SQLAlchemy хранит у Enum имя члена, и
     # значение по умолчанию в миграции разошлось бы с тем, что пишет ORM.
     status: Mapped[str] = mapped_column(String(32), default="Действующая", index=True)
@@ -210,8 +210,7 @@ class Case(Base):
     # Оптимистичная блокировка карточки дела (п. 6.4 ТС): одновременная работа
     # разрешена, но правка поверх чужой версии отклоняется с 409.
     version: Mapped[int] = mapped_column(Integer, default=1)
-    # Краткое содержание дела, составленное ИИ по аннотациям документов (ТЗ АГП
-    # п. 12.4: «аннотация документа или дела»).
+    # Краткое содержание дела, составленное ИИ по аннотациям документов.
     annotation: Mapped[str] = mapped_column(Text, default="")
     department_id: Mapped[str | None] = mapped_column(
         ForeignKey("departments.id"), nullable=True, index=True
@@ -625,14 +624,14 @@ class Document(Base):
     copy_signer: Mapped[str] = mapped_column(Text, default="")
     copy_cms_key: Mapped[str] = mapped_column(String(1024), default="")
 
-    # --- Атрибуты индексирования (ТЗ АГП п. 3): подразделение и число страниц ---
+    # --- Атрибуты индексирования: подразделение и число страниц ---
     department_id: Mapped[str | None] = mapped_column(
         ForeignKey("departments.id"), nullable=True, index=True
     )
     department: Mapped["Department | None"] = relationship()
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    # --- Качество распознавания и дубли (ТЗ АГП п. 12.5) ---
+    # --- Качество распознавания и дубли ---
     # Средняя уверенность OCR по документу, 0–100; None — оценка не делалась
     # (цифровой текст без распознавания).
     ocr_confidence: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
@@ -680,7 +679,7 @@ class Document(Base):
 
 
 # =============================================================================
-# ТЗ «Азиатский Газопровод»: модули п. 8 и ИИ-агент п. 12
+# Архивные реестры, импорт, администрирование и ИИ-агент
 # =============================================================================
 
 class ExtractedEntity(Base):

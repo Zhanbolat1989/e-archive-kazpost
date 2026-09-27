@@ -42,7 +42,7 @@ def export_case_xml(case_id: str, request: Request, db: Session = Depends(get_db
 def export_package(request: Request, db: Session = Depends(get_db),
                    user: User = Depends(require_roles(Role.admin))):
     """Резервная копия архива одним пакетом: manifest.xml + файлы документов
-    (ТЗ АГП п. 9 «резервное копирование и восстановление»).
+    (резервное копирование и восстановление).
 
     Файлы кладутся под своими ключами хранения — теми же, что записаны в
     манифесте, поэтому пакет принимается обратно модулем импорта без правки:

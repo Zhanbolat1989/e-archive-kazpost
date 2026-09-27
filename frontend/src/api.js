@@ -42,7 +42,7 @@ export const api = {
     return fetch(`${BASE}/auth/me`, { headers: authHeaders() }).then(handle);
   },
 
-  // Фильтры модуля «Документы» (ТЗ АГП п. 8): подразделение, вид, дело, год,
+  // Фильтры модуля «Документы»: подразделение, вид, дело, год,
   // срок хранения/уничтожения, очередь ручной проверки распознавания.
   listDocuments(params = {}) {
     const q = new URLSearchParams(
@@ -707,7 +707,7 @@ export const api = {
     return fetch(`${BASE}/documents/${id}/usage`, { headers: authHeaders() }).then(handle);
   },
 
-  // ---- Качество оцифровки и реквизиты (ТЗ АГП п. 12.1, 12.5) ----
+  // ---- Качество оцифровки и реквизиты ----
   reviewQueue() {
     return fetch(`${BASE}/documents/meta/review`, { headers: authHeaders() }).then(handle);
   },
@@ -723,7 +723,7 @@ export const api = {
     return fetch(`${BASE}/documents/${id}/changes`, { headers: authHeaders() }).then(handle);
   },
 
-  // ---- Архивные запросы (ТЗ АГП п. 8) ----
+  // ---- Архивные запросы ----
   listArchiveRequests(params = {}) {
     const q = new URLSearchParams(
       Object.entries(params).filter(([, v]) => v !== "" && v != null)
@@ -897,7 +897,7 @@ export const api = {
     return fetch(`${BASE}/support/sla?${q}`, { headers: authHeaders() }).then(handle);
   },
 
-  // ---- Администрирование (ТЗ АГП п. 8–9) ----
+  // ---- Администрирование ----
   changeHistory(params = {}) {
     const q = new URLSearchParams(
       Object.entries(params).filter(([, v]) => v !== "" && v != null)
